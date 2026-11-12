@@ -1,0 +1,4 @@
+fcm-tokens.json
+.env
+secrets/
+node_modules/

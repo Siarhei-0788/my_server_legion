@@ -1,0 +1,54 @@
+name: server-ci
+
+# Вариант для случая, когда папка my-server — корень отдельного репозитория.
+# Если сервер лежит внутри общего репозитория, используйте файл
+# .github/workflows/server-ci.yml в корне проекта.
+
+on:
+  push:
+    paths:
+      - '**'
+  pull_request:
+    paths:
+      - '**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: legion_test
+          POSTGRES_USER: legion
+          POSTGRES_PASSWORD: legion
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U legion -d legion_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgres://legion:legion@127.0.0.1:5432/legion_test
+      TEST_REDIS_URL: redis://127.0.0.1:6379
+      REGISTRATION_CODE_SECRET: integration-secret-0123456789-0123456789
+      FIREBASE_PROJECT_ID: legion-integration-test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run test:unit
+      - run: npm run test:integration
