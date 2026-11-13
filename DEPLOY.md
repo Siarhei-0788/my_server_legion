@@ -1,151 +1,165 @@
-# Развёртывание сервера LegiON в облаке
+# Развёртывание сервера LegiON
 
-Два варианта. Для диплома и демонстрации на телефонах — **вариант A** (30–40 минут,
-без Firebase и Docker). Вариант B — «взрослый» стек, если нужен настоящий продакшен.
+Текущая схема (вариант A, demo-режим):
+
+```
+телефон ──HTTPS/WSS──▶ nginx (dev.myoffer.life:443, Let's Encrypt)
+                          └──▶ 127.0.0.1:3000  pm2 «legion» → node server-dev.js
+```
+
+| Что | Где |
+|---|---|
+| Код | `/home/myoffer/projects/my_server_legion` (запуск прямо из репозитория) |
+| Процесс | pm2, имя `legion`, пользователь `myoffer` |
+| Node.js | v24 через nvm (`~/.nvm/versions/node/v24.14.1`) |
+| Переменные окружения | `~/.config/legion/legion.env` (права `600`, **не в репозитории**) |
+| Состояние | `~/.local/share/legion/state.json` |
+| Логи | `pm2 logs legion` (`~/.pm2/logs/legion-*.log`) |
+| Публичный адрес | `https://dev.myoffer.life` |
+
+Без Firebase, Docker и Caddy: HTTPS даёт уже установленный nginx.
 
 ---
 
-## Вариант A. Демо-сервер за Caddy (рекомендуется)
-
-Что нужно: VPS с Ubuntu 22.04/24.04 (1 CPU, 1 ГБ RAM достаточно), домен или поддомен,
-доступ по SSH с sudo.
-
-### 1. DNS
-
-A-запись `legion.example.com` → IP сервера. Проверка: `ping legion.example.com`.
-
-### 2. Подготовка сервера
+## 1. Зависимости
 
 ```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y curl ufw
-sudo ufw allow OpenSSH && sudo ufw allow 80 && sudo ufw allow 443 && sudo ufw enable
+cd ~/projects/my_server_legion
+grep -c "socket.emit('rtc:ready')" server-dev.js   # должно быть 1 (фикс сигналинга звонков)
+npm ci --omit=dev --no-audit --no-fund
 ```
 
-Node.js 24:
+## 2. Переменные окружения
 
-```bash
-curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
-sudo apt install -y nodejs
-node --version    # v24.x
-```
-
-Caddy (даёт бесплатный HTTPS автоматически):
-
-```bash
-sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
-sudo apt update && sudo apt install -y caddy
-```
-
-### 3. Код и зависимости
-
-Скопируйте папку `my-server` на сервер (scp/rsync/git), затем:
-
-```bash
-sudo useradd --system --create-home --home-dir /opt/legion legion
-sudo chown -R legion:legion /opt/legion
-cd /opt/legion
-sudo -u legion npm ci --omit=dev
-sudo mkdir -p /var/lib/legion && sudo chown legion:legion /var/lib/legion
-```
-
-### 4. Переменные окружения
-
-`/etc/legion.env` (права `600`, владелец root):
+`~/.config/legion/legion.env`:
 
 ```ini
 PORT=3000
-STATE_FILE=/var/lib/legion/state.json
+STATE_FILE=/home/myoffer/.local/share/legion/state.json
 ADMIN_USERNAME=admin
-ADMIN_PASSWORD=замените-на-длинный-пароль
+ADMIN_PASSWORD=длинный-случайный-пароль
 STUN_URLS=stun:stun.l.google.com:19302
-# TURN — только если подняли coturn (см. раздел ниже)
-# TURN_URLS=turn:legion.example.com:3478?transport=udp,turns:legion.example.com:5349?transport=tcp
+# TURN — только если поднят coturn (см. ниже)
+# TURN_URLS=turn:dev.myoffer.life:3478?transport=udp,turns:dev.myoffer.life:5349?transport=tcp
 # TURN_SHARED_SECRET=тот-же-секрет-что-в-turnserver.conf
 AUTH_RATE_LIMIT=30
-```
-
-### 5. systemd
-
-`/etc/systemd/system/legion.service`:
-
-```ini
-[Unit]
-Description=LegiON relay
-After=network.target
-
-[Service]
-Type=simple
-User=legion
-WorkingDirectory=/opt/legion
-EnvironmentFile=/etc/legion.env
-ExecStart=/usr/bin/node /opt/legion/server-dev.js
-Restart=always
-RestartSec=3
-# корректное завершение: состояние сохраняется по SIGTERM
-KillSignal=SIGTERM
-TimeoutStopSec=10
-
-[Install]
-WantedBy=multi-user.target
+RTC_CALL_TIMEOUT_MS=60000
 ```
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now legion
-sudo systemctl status legion
-journalctl -u legion -n 50 --no-pager
+mkdir -p ~/.config/legion ~/.local/share/legion
+chmod 600 ~/.config/legion/legion.env
+openssl rand -base64 18 | tr -d '/+='   # сгенерировать пароль
 ```
 
-В логе должно быть: `LegiON demo server on 0.0.0.0:3000`, `state file: /var/lib/legion/state.json`.
+Администратор создаётся при **первом** запуске, когда `state.json` ещё нет. Если потом
+поменять `ADMIN_PASSWORD`, пароль уже созданного админа может остаться прежним.
 
-### 6. Caddy и HTTPS
+## 3. Запуск через pm2
 
-`/etc/caddy/Caddyfile`:
-
+```bash
+cd ~/projects/my_server_legion
+pm2 start server-dev.js --name legion \
+  --node-args="--env-file=/home/myoffer/.config/legion/legion.env" \
+  --kill-timeout 10000          # время на сохранение state.json по SIGINT
+pm2 save
 ```
-legion.example.com {
-    encode gzip
-    reverse_proxy 127.0.0.1:3000
+
+Автозапуск после перезагрузки (один раз, нужен sudo):
+
+```bash
+pm2 startup systemd -u myoffer --hp /home/myoffer   # выведет команду с sudo — выполнить её
+pm2 save
+```
+
+Проверка:
+
+```bash
+pm2 status legion                           # online
+pm2 logs legion --lines 20 --nostream       # "LegiON demo server on 0.0.0.0:3000",
+                                            # "admin: admin / (from ADMIN_PASSWORD)",
+                                            # "state file: /home/myoffer/.local/share/legion/state.json"
+curl -fsS http://127.0.0.1:3000/health      # {"status":"ok","demo":true,...}
+```
+
+## 4. nginx
+
+Блок в `/etc/nginx/nginx.conf` уже есть, менять его не нужно. Обязательны заголовки
+`Upgrade`/`Connection`: без них не работает WebSocket Socket.IO, а значит и звонки.
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name dev.myoffer.life;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_cache_bypass $http_upgrade;
+    }
+
+    ssl_certificate     /etc/letsencrypt/live/dev.myoffer.life/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/dev.myoffer.life/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
 }
 ```
 
-```bash
-sudo systemctl restart caddy
-curl https://legion.example.com/health
-```
+После правок: `sudo nginx -t && sudo systemctl reload nginx`.
 
-Ожидаемый ответ: `{"status":"ok","demo":true,...}`. Сертификат Caddy получит сам.
-
-### 7. Настройка приложения
-
-На **каждом** устройстве: ☰ → «Настройки сети» → `https://legion.example.com` →
-«Подключиться». Вход администратора: `admin` / пароль из `ADMIN_PASSWORD`.
-
-> Сборка приложения: release требует HTTPS (так и есть), debug допускает и HTTP —
-> для облака это не важно, но `https://` обязателен.
-
-### 8. Обновление и бэкап
+Проверка снаружи:
 
 ```bash
-# обновление
-sudo -u legion rsync -a --delete ./ /opt/legion/   # с локальной машины
-sudo systemctl restart legion
-
-# бэкап состояния
-sudo cp /var/lib/legion/state.json /var/lib/legion/state-$(date +%F).json
+curl -fsS https://dev.myoffer.life/health; echo
+# {"status":"ok","demo":true,...}
+curl -fsS "https://dev.myoffer.life/socket.io/?EIO=4&transport=polling" | head -c 40; echo
+# 0{"sid":...
+curl -si -N -H "Connection: Upgrade" -H "Upgrade: websocket" \
+  -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+  "https://dev.myoffer.life/socket.io/?EIO=4&transport=websocket" | head -1
+# HTTP/1.1 101 Switching Protocols
 ```
 
-Состояние (пользователи, токены, устройства, сообщения) хранится в `state.json`
-и переживает перезапуск и повторный деплой.
+## 5. Настройка приложения
+
+На **каждом** телефоне: ☰ → «Настройки сети» → `https://dev.myoffer.life` → «Подключиться».
+Вход администратора: `admin` / пароль из `ADMIN_PASSWORD`. Второму устройству выдать код
+регистрации (Профиль → «Сгенерировать код»).
+
+## 6. Обновление и бэкап
+
+```bash
+cd ~/projects/my_server_legion
+cp ~/.local/share/legion/state.json ~/.local/share/legion/state-$(date +%F-%H%M).json  # бэкап
+git pull
+grep -c "socket.emit('rtc:ready')" server-dev.js   # 1
+npm ci --omit=dev --no-audit --no-fund
+pm2 restart legion
+curl -fsS https://dev.myoffer.life/health
+```
+
+Состояние (пользователи, токены, устройства, сообщения) лежит вне репозитория и переживает
+перезапуск и обновление кода.
+
+Полезное:
+
+```bash
+pm2 logs legion            # логи в реальном времени
+pm2 restart legion         # после правки legion.env
+pm2 describe legion        # параметры запуска
+```
 
 ---
 
 ## TURN: чтобы звонки работали через мобильные сети
 
-Без TURN звонок проходит только когда оба устройства в одной сети или за «удобным» NAT.
+Без TURN звонок проходит, только когда оба устройства в одной сети или за «удобным» NAT.
 
 ```bash
 sudo apt install -y coturn
@@ -160,44 +174,63 @@ tls-listening-port=5349
 fingerprint
 lt-cred-mech
 use-auth-secret
-static-auth-secret=СЛУЧАЙНЫЙ_СЕКРЕТ_32+_СИМВОЛОВ
-realm=legion.example.com
-external-ip=IP_СЕРВЕРА
+static-auth-secret=СЛУЧАЙНЫЙ_СЕКРЕТ_32+_СИМВОЛОВ   # openssl rand -hex 32
+realm=dev.myoffer.life
+external-ip=IP_СЕРВЕРА        # при NAT в облаке: ВНЕШНИЙ_IP/ПРИВАТНЫЙ_IP
 min-port=49160
 max-port=49200
-cert=/etc/letsencrypt/live/legion.example.com/fullchain.pem
-pkey=/etc/letsencrypt/live/legion.example.com/privkey.pem
+cert=/etc/letsencrypt/live/dev.myoffer.life/fullchain.pem
+pkey=/etc/letsencrypt/live/dev.myoffer.life/privkey.pem
 no-cli
 no-multicast-peers
 no-loopback-peers
 ```
 
+Сертификат nginx/certbot читается только root, а coturn работает от `turnserver`, поэтому
+нужен доступ к ключу:
+
 ```bash
+sudo setfacl -R -m u:turnserver:rX /etc/letsencrypt/live /etc/letsencrypt/archive
 sudo systemctl enable --now coturn
+```
+
+Порты: в `ufw` (если включён) и в облачном firewall провайдера:
+
+```bash
 sudo ufw allow 3478/tcp && sudo ufw allow 3478/udp
 sudo ufw allow 5349/tcp
 sudo ufw allow 49160:49200/udp && sudo ufw allow 49160:49200/tcp
 ```
 
-В `/etc/legion.env` раскомментируйте `TURN_URLS` и `TURN_SHARED_SECRET` (тот же секрет),
-перезапустите `legion`. Проверка ICE — на https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/
-(в списке должен появиться `relay`).
+В `~/.config/legion/legion.env` раскомментировать `TURN_URLS` и `TURN_SHARED_SECRET`
+(тот же секрет), затем `pm2 restart legion`. В логе должно появиться `TURN: turn:dev.myoffer.life:3478...`
+вместо `not configured`.
+
+Проверка ICE: https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/
+(в списке кандидатов должен быть `relay`). Временные учётные данные:
+
+```bash
+SECRET=$(grep '^TURN_SHARED_SECRET=' ~/.config/legion/legion.env | cut -d= -f2-)
+U="$(( $(date +%s) + 3600 )):smoke"
+P=$(printf '%s' "$U" | openssl dgst -sha1 -hmac "$SECRET" -binary | base64)
+echo "URI: turn:dev.myoffer.life:3478   username: $U   password: $P"
+```
 
 ---
 
 ## Вариант B. Production-стек (Docker + Firebase + PostgreSQL + Redis)
 
-Нужны: Docker и Docker Compose на VPS, проект Firebase (Email/Password + FCM),
-service account JSON, домен, сертификаты для coturn.
+Только при наличии проекта Firebase (Email/Password + FCM) и service account JSON.
+Перед запуском остановить demo: `pm2 delete legion && pm2 save` (оба слушают порт 3000).
 
 ```bash
-cd /opt/legion
-cp .env.example .env      # заполнить пароли, секреты, пути к секретам
+cd ~/projects/my_server_legion
+cp .env.example .env      # заполнить пароли, секреты, пути к секретам; TRUST_PROXY=1
 docker compose up -d --build
 curl http://127.0.0.1:3000/health/ready
 ```
 
-Дальше — Caddy перед портом 3000 (как в варианте A) и выдача прав администратора:
+nginx остаётся тем же (`proxy_pass http://127.0.0.1:3000`). Права администратора:
 
 ```bash
 node scripts/set-firebase-claims.js <firebase-uid> grant admin
@@ -209,18 +242,31 @@ node scripts/set-firebase-claims.js <firebase-uid> grant admin
 
 ## Чек-лист после деплоя
 
-1. `https://legion.example.com/health` → 200.
+1. `https://dev.myoffer.life/health` → 200.
 2. Регистрация двух устройств по коду администратора.
 3. Чат: сообщение доходит за 3–5 секунд.
 4. Карта: позиция второго устройства появляется.
 5. Сбор: уведомление приходит, «Принял» работает.
 6. Звонок: в одной Wi-Fi, затем через мобильную сеть (с TURN).
-7. `journalctl -u legion -f` — видны запросы, ошибок нет.
+7. `pm2 logs legion` — видны запросы, ошибок нет.
 
-## Ограничения варианта A
+## Неполадки
 
-- Нет FCM: уведомления приходят, пока приложение живо (foreground-сервис опроса).
-  Android может выгрузить приложение — для «сбора по тревоге» это риск.
+| Симптом | Что проверить |
+|---|---|
+| `/health` → 502 | `pm2 status legion`, `pm2 logs legion`; слушает ли 3000: `ss -ltnp \| grep 3000` |
+| Порт 3000 занят | Другой процесс pm2 или старый запуск: `pm2 ls`, `ss -ltnp \| grep 3000` |
+| Socket.IO не отвечает `0{"sid"` / нет `101` | В блоке nginx нет `proxy_http_version 1.1` или заголовков `Upgrade`/`Connection` |
+| `http://dev.myoffer.life` → 404 вместо редиректа | В блоке `listen 80` после списка `server_name` не хватает `;` |
+| После перезагрузки сервер не поднялся | Не выполнен `pm2 startup` или забыт `pm2 save` |
+| Звонок висит на «Соединение…» | В `server-dev.js` нет `rtc:ready` → обновить код |
+| «Сигналинг отклонил запрос: target_unreachable» | У собеседника не запущено приложение / нет сети (в demo нет push) |
+| Звонок соединяется, но нет звука/видео через мобильную сеть | TURN: `systemctl status coturn`, порты 3478 и 49160–49200 (UDP!), `external-ip`, trickle-ice даёт `relay` |
+
+## Ограничения demo-режима
+
+- Нет FCM: уведомления и входящие звонки приходят, пока приложение живо (foreground-сервис
+  опроса). Android может выгрузить приложение — не закрывайте его свайпом.
 - Один процесс и файл состояния: не рассчитан на сотни пользователей.
 - Демо-вход открыт: любой, кто знает адрес, может создать аккаунт. Для диплома
-  приемлемо; для публичного сервиса используйте вариант B.
+  приемлемо; для публичного сервиса — вариант B.
