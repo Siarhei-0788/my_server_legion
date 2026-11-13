@@ -80,6 +80,19 @@ log "Зависимости"
 ( cd "$APP_DIR" && sudo -u "$SERVICE_USER" npm ci --omit=dev --no-audit --no-fund >/dev/null )
 log "установлено пакетов: $(ls "$APP_DIR/node_modules" | wc -l)"
 
+# Повторный запуск (обновление) не должен менять пароль админа, TURN и домен:
+# берём прежние значения, если они не заданы явно.
+if [[ -f /etc/legion.env ]]; then
+    old_env() { grep -E "^$1=" /etc/legion.env | tail -n1 | cut -d= -f2- || true; }
+    [[ -n "$ADMIN_PASSWORD" ]] || ADMIN_PASSWORD="$(old_env ADMIN_PASSWORD)"
+    [[ -n "$TURN_URLS" ]] || TURN_URLS="$(old_env TURN_URLS)"
+    [[ -n "$TURN_SHARED_SECRET" ]] || TURN_SHARED_SECRET="$(old_env TURN_SHARED_SECRET)"
+fi
+if [[ -z "$DOMAIN" && -f /etc/caddy/Caddyfile ]]; then
+    PREV_DOMAIN="$(awk 'NF && $1 !~ /^#/ {print $1; exit}' /etc/caddy/Caddyfile)"
+    [[ "$PREV_DOMAIN" == :* ]] || DOMAIN="$PREV_DOMAIN"
+fi
+
 if [[ -z "$DOMAIN" ]]; then
     IP="$(curl -fsS https://api.ipify.org || curl -fsS https://ifconfig.me || true)"
     [[ -n "$IP" ]] || die "Не удалось определить внешний IP. Задайте DOMAIN=..."
