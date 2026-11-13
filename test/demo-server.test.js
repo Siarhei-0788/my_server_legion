@@ -173,6 +173,13 @@ describe('demo server contract', () => {
     const receivedAttachment = await api('/api/messages', { token: bobToken, deviceId: 'device-bob' });
     assert.equal(receivedAttachment.body[2].text.length, attachmentText.length);
 
+    // ?after=<id> отдаёт только более новые сообщения.
+    const firstId = receivedAttachment.body[0].id;
+    const newer = await api(`/api/messages?after=${firstId}`, { token: bobToken, deviceId: 'device-bob' });
+    assert.deepEqual(newer.body.map((message) => message.id), receivedAttachment.body.slice(1).map((m) => m.id));
+    const lastId = receivedAttachment.body[2].id;
+    assert.deepEqual((await api(`/api/messages?after=${lastId}`, { token: bobToken, deviceId: 'device-bob' })).body, []);
+
     const alicePhones = await api('/api/phones', { token: aliceToken, deviceId: 'device-alice' });
     assert.equal(alicePhones.status, 200);
     assert.deepEqual(alicePhones.body.map((phone) => phone.id), ['device-bob']);

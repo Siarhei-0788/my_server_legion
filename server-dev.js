@@ -496,8 +496,12 @@ app.post('/api/send', authenticate, requireAccess, (req, res) => {
 app.get('/api/messages', authenticate, requireAccess, (req, res) => {
   const device = currentDevice(req);
   if (!device) return res.status(403).json({ error: 'Device is not registered to this account' });
+  // ?after=<id> — только новые сообщения: клиент опрашивает каждые несколько секунд,
+  // и без этого каждый раз заново скачивал бы до 500 сообщений вместе с вложениями.
+  const after = Number(req.query.after);
   const list = messages
     .filter((message) => message.toPhone === device.phoneId)
+    .filter((message) => !Number.isSafeInteger(after) || after <= 0 || message.id > after)
     .slice(-500)
     .map((message) => ({
       id: String(message.id),

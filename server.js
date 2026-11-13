@@ -705,12 +705,14 @@ app.post('/api/push', authenticate, requireRecordBody, async (req, res) => {
 app.get('/api/messages', authenticate, async (req, res) => {
     const phoneId = req.get('x-device-id');
     if (!await verifyDevice(req.user.uid, phoneId)) return res.status(403).json({ error: 'Device is not registered to this account' });
+    // ?after=<id> — только новые сообщения (клиент опрашивает каждые несколько секунд).
+    const after = /^\d{1,18}$/.test(String(req.query.after || '')) ? req.query.after : '0';
     const result = await pool.query(
         `SELECT id::text AS id, sender_name AS "from", recipient_phone_id AS "to", text, data,
                 (extract(epoch FROM created_at) * 1000)::bigint AS "timestamp"
-         FROM messages WHERE recipient_phone_id = $1
-         ORDER BY created_at DESC LIMIT 500`,
-        [phoneId]
+         FROM messages WHERE recipient_phone_id = $1 AND id > $2::bigint
+         ORDER BY id DESC LIMIT 500`,
+        [phoneId, after]
     );
     return res.json(result.rows.reverse());
 });
