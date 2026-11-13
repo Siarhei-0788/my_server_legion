@@ -361,12 +361,15 @@ app.post('/api/registration-codes/verify', authenticate, (req, res) => {
 // ---------------------------------------------------------------------------
 
 app.post('/api/register', authenticate, requireAccess, (req, res) => {
-  const { phoneId, name, fcmToken } = req.body || {};
+  const { phoneId, name, fcmToken, callsign } = req.body || {};
   if (typeof phoneId !== 'string' || phoneId.trim().length < 1 || phoneId.trim().length > 128) {
     return res.status(400).json({ error: 'phoneId must be a non-empty string of at most 128 characters' });
   }
   if (name !== undefined && name !== null && (typeof name !== 'string' || name.length > 120)) {
     return res.status(400).json({ error: 'name must be a string of at most 120 characters' });
+  }
+  if (callsign !== undefined && callsign !== null && (typeof callsign !== 'string' || callsign.length > 120)) {
+    return res.status(400).json({ error: 'callsign must be a string of at most 120 characters' });
   }
   const id = phoneId.trim();
   const existing = devices.get(id);
@@ -377,6 +380,8 @@ app.post('/api/register', authenticate, requireAccess, (req, res) => {
     phoneId: id,
     username: req.user.username,
     name: (name && name.trim()) || 'Android device',
+    // Пустой позывной не затирает ранее сохранённый (как в production-сервере).
+    callsign: (callsign && callsign.trim()) || existing?.callsign || null,
     fcmToken: fcmToken || null,
     lastSeen: now(),
   });
@@ -388,7 +393,7 @@ app.get('/api/phones', authenticate, requireAccess, (req, res) => {
   const list = [...devices.values()]
     .filter((device) => norm(device.username) !== norm(req.user.username))
     .sort((a, b) => b.lastSeen - a.lastSeen)
-    .map((device) => ({ id: device.phoneId, name: device.name, lastSeen: new Date(device.lastSeen).toISOString() }));
+    .map(publicDevice);
   res.json(list);
 });
 
@@ -397,8 +402,19 @@ app.get('/api/phone/:id', authenticate, requireAccess, (req, res) => {
   if (!device || norm(device.username) === norm(req.user.username)) {
     return res.status(404).json({ error: 'Phone not found' });
   }
-  res.json({ id: device.phoneId, name: device.name, lastSeen: new Date(device.lastSeen).toISOString() });
+  res.json(publicDevice(device));
 });
+
+// Позывной нужен клиенту для списка собеседников: без него показывается id устройства.
+function publicDevice(device) {
+  return {
+    id: device.phoneId,
+    name: device.name,
+    username: device.username,
+    callsign: device.callsign || device.username,
+    lastSeen: new Date(device.lastSeen).toISOString(),
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Сообщения
@@ -590,7 +606,9 @@ io.on('connection', (socket) => {
     }, CALL_TIMEOUT_MS);
     calls.set(callId, call);
 
-    io.to(`phone:${to}`).emit('rtc:incoming', { callId, from: device.phoneId, callType });
+    io.to(`phone:${to}`).emit('rtc:incoming', {
+      callId, from: device.phoneId, fromName: device.callsign || device.username, callType,
+    });
     return reply(ack, { ok: true, callId, status: 'ringing' });
   });
 

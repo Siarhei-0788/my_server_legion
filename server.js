@@ -815,13 +815,18 @@ async function handleRtcEvent(socket, event, payload, callback) {
             } finally {
                 client.release();
             }
-            const incoming = { callId, from: phoneId, callType };
+            const caller = await pool.query(
+                "SELECT COALESCE(NULLIF(callsign, ''), username) AS name FROM devices WHERE phone_id = $1",
+                [phoneId]
+            );
+            const fromName = caller.rows[0]?.name || '';
+            const incoming = { callId, from: phoneId, fromName, callType };
             const sockets = await io.in(`phone:${to}`).fetchSockets();
             if (sockets.length) {
                 io.to(`phone:${to}`).emit('rtc:incoming', incoming);
             } else {
                 const delivery = await sendPush([to], callType === 'video' ? 'Входящий видеозвонок' : 'Входящий аудиозвонок', 'Входящий звонок', {
-                    type: 'rtc_call', callId, callerPhoneId: phoneId, callType
+                    type: 'rtc_call', callId, callerPhoneId: phoneId, callerName: fromName, callType
                 });
                 if (delivery.failed || delivery.skipped) {
                     await finishCall(callId, 'unreachable', [phoneId]);
