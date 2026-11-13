@@ -176,6 +176,16 @@ describe('demo server contract', () => {
     const alicePhones = await api('/api/phones', { token: aliceToken, deviceId: 'device-alice' });
     assert.equal(alicePhones.status, 200);
     assert.deepEqual(alicePhones.body.map((phone) => phone.id), ['device-bob']);
+    assert.equal(alicePhones.body[0].username, 'bob');
+    assert.equal(alicePhones.body[0].callsign, 'bob', 'without a callsign the username is shown, not the device id');
+
+    // Удаление чата: только создатель; чат и его сообщения пропадают у всех участников.
+    assert.equal((await api(`/api/chats/${chatId}`, { method: 'DELETE', token: bobToken })).status, 404);
+    assert.equal((await api(`/api/chats/${chatId}`, { method: 'DELETE', token: aliceToken })).status, 200);
+    assert.ok(!(await api('/api/chats', { token: bobToken })).body.some((chat) => chat.id === chatId));
+    const bobAfterChatDelete = await api('/api/messages', { token: bobToken, deviceId: 'device-bob' });
+    assert.ok(!bobAfterChatDelete.body.some((message) => message.text === 'Только для группы'));
+    assert.equal((await api(`/api/chats/${chatId}`, { method: 'DELETE', token: aliceToken })).status, 404);
 
     const adminUsers = await api('/api/admin/users', { token: adminToken });
     assert.equal(adminUsers.status, 200);

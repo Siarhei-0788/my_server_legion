@@ -206,6 +206,21 @@ function seedAdmin() {
     res.json(chat);
   });
 
+  // Как в production: удалить может только создатель; вместе с чатом удаляются его
+  // сообщения (включая служебное chat_created, иначе клиент восстановит чат из истории).
+  app.delete('/api/chats/:id', authenticate, requireAccess, (req, res) => {
+    const chat = chats.get(req.params.id);
+    if (!chat || chat.createdBy !== norm(req.user.username)) {
+      return res.status(404).json({ error: 'Chat not found or not owned by this account' });
+    }
+    chats.delete(req.params.id);
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index].data?.chat_id === req.params.id) messages.splice(index, 1);
+    }
+    scheduleSave();
+    res.json({ status: 'deleted', id: req.params.id });
+  });
+
   app.delete('/api/admin/users/:username', authenticate, requireAccess, requireAdmin, (req, res) => {
     const username = norm(req.params.username);
     if (!/^[a-z0-9._-]{1,64}$/.test(username) || username === ADMIN_USERNAME || username === norm(req.user.username)) {
