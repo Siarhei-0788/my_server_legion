@@ -578,6 +578,10 @@ io.on('connection', (socket) => {
     if (!devices.has(to)) return reply(ack, { ok: false, error: 'target_not_registered' });
     const busy = [...calls.values()].some((call) => call.caller === to || call.target === to);
     if (busy) return reply(ack, { ok: false, error: 'user_busy' });
+    // В demo-режиме нет FCM: если у собеседника нет открытого сокета, вызов не дойдёт.
+    if (!io.sockets.adapter.rooms.get(`phone:${to}`)?.size) {
+      return reply(ack, { ok: false, error: 'target_unreachable' });
+    }
 
     const callId = crypto.randomUUID();
     const call = { caller: device.phoneId, target: to, type: callType, status: 'ringing', timer: null };
@@ -648,6 +652,10 @@ io.on('connection', (socket) => {
     io.to(`phone:${found.peer}`).emit(event, { callId, from: device.phoneId, description });
     return reply(ack, { ok: true, callId });
   }
+
+  // Клиент (RtcSignalingClient) начинает вызов/приём только после этого события —
+  // так же, как с production-сервером. Без него звонок «висит» на «Соединение...».
+  socket.emit('rtc:ready');
 });
 
 loadState();
