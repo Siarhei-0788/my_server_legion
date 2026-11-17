@@ -188,4 +188,75 @@ describe('rtc signaling', () => {
     assert.equal(second.ok, false);
     assert.equal(second.error, 'user_busy');
   });
+
+  it('shares tactical marks with everyone and notifies over the socket', async () => {
+    const adminToken = await devLogin('admin', 'demo-admin-pass');
+    const gregToken = await prepareUser(adminToken, 'greg', 'phone-greg');
+    const hankToken = await prepareUser(adminToken, 'hank', 'phone-hank');
+    const hank = connect(hankToken, 'phone-hank');
+    await once(hank, 'connect');
+
+    const markId = '6f1d2a3b-4c5d-4e6f-8a9b-0c1d2e3f4a5b';
+    const changed = once(hank, 'marks:changed');
+    const created = await api('/api/marks', {
+      method: 'POST', token: gregToken,
+      body: { id: markId, type: 'Огневая точка', label: 'ОТ-1', lat: 55.75, lng: 37.61, icon: 'builtin:fire' },
+    });
+    assert.equal(created.status, 200);
+    await changed; // знак появляется у других в реальном времени
+    const listed = await api('/api/marks', { token: hankToken });
+    assert.equal(listed.body.find((mark) => mark.id === markId).createdBy, 'greg');
+
+    // Повторная отправка того же id не создаёт дубликат.
+    await api('/api/marks', { method: 'POST', token: gregToken, body: { id: markId, type: 'X', lat: 1, lng: 1 } });
+    assert.equal((await api('/api/marks', { token: hankToken })).body.filter((mark) => mark.id === markId).length, 1);
+
+    const batch = await api('/api/marks/batch', {
+      method: 'POST', token: hankToken,
+      body: { marks: [
+        { id: '11111111-2222-4333-8444-555555555555', type: 'Точка', label: 'WP1', lat: 55.1, lng: 37.1 },
+        { id: '11111111-2222-4333-8444-666666666666', type: 'Точка', label: 'WP2', lat: 55.2, lng: 37.2 },
+      ] },
+    });
+    assert.equal(batch.body.added, 2);
+    assert.equal((await api('/api/marks/batch', { method: 'POST', token: hankToken, body: { marks: [{ id: 'bad' }] } })).status, 400);
+
+    // Удалить может автор или администратор.
+    assert.equal((await api(`/api/marks/${markId}`, { method: 'DELETE', token: hankToken })).status, 403);
+    assert.equal((await api(`/api/marks/${markId}`, { method: 'DELETE', token: adminToken })).status, 200);
+
+    // Значок: только PNG до 100 КБ.
+    const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex').toString('base64');
+    assert.equal((await api('/api/marks/icons', { method: 'POST', token: gregToken, body: { id: 'tank', name: 'Танк', data: png } })).status, 200);
+    assert.equal((await api('/api/marks/icons', { method: 'POST', token: gregToken, body: { id: 'bad', name: 'x', data: 'aGVsbG8=' } })).status, 400);
+    assert.equal((await api('/api/marks/icons/tank', { token: hankToken })).body.data, png);
+    assert.equal((await api('/api/marks/icons', { method: 'POST', token: hankToken, body: { id: 'tank', name: 'Чужой', data: png } })).status, 409);
+  });
+
+  it('ends an accepted call when the call screen disconnects without hangup', async () => {
+    const adminToken = await devLogin('admin', 'demo-admin-pass');
+    const eveToken = await prepareUser(adminToken, 'eve', 'phone-eve');
+    const frankToken = await prepareUser(adminToken, 'frank', 'phone-frank');
+
+    const eve = connect(eveToken, 'phone-eve');
+    const frankBackground = connect(frankToken, 'phone-frank'); // фоновый сокет (AlertService)
+    await Promise.all([once(eve, 'connect'), once(frankBackground, 'connect')]);
+
+    const incoming = once(frankBackground, 'rtc:incoming');
+    const call = await emit(eve, 'rtc:call', { to: 'phone-frank', callType: 'audio' });
+    assert.equal(call.ok, true);
+    await incoming;
+
+    const frankCall = connect(frankToken, 'phone-frank'); // экран звонка
+    await once(frankCall, 'connect');
+    assert.equal((await emit(frankCall, 'rtc:accept', { callId: call.callId })).ok, true);
+
+    const ended = once(eve, 'rtc:ended');
+    frankCall.disconnect(); // закрыли экран без «Завершить»
+    assert.equal((await ended).reason, 'disconnected');
+
+    // Звонок не завис: можно звонить снова.
+    const again = await emit(eve, 'rtc:call', { to: 'phone-frank', callType: 'audio' });
+    assert.equal(again.ok, true, JSON.stringify(again));
+  });
 });

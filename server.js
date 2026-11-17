@@ -225,18 +225,43 @@ app.get('/api/admin/users', authenticate, async (req, res) => {
     return res.json(result.rows.map((row) => row.username));
 });
 
+// Для панели администратора: пользователи со структурированным профилем и статусом.
+app.get('/api/admin/users/details', authenticate, async (req, res) => {
+    if (req.user.admin !== true) return res.status(403).json({ error: 'Administrator access required' });
+    const result = await pool.query(
+        `SELECT d.username,
+                COALESCE(MAX(NULLIF(p.callsign, '')), MAX(NULLIF(d.callsign, '')), d.username) AS callsign,
+                COALESCE(MAX(p.position), '') AS position,
+                COALESCE(MAX(p.unit), '') AS unit,
+                false AS admin,
+                BOOL_OR(d.last_seen >= now() - INTERVAL '2 minutes') AS "isOnline",
+                MAX(d.last_seen) AS "lastSeen",
+                COUNT(*)::int AS devices
+         FROM devices d
+         LEFT JOIN user_profiles p ON p.username = d.username
+         WHERE d.username IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM deleted_users deleted WHERE deleted.username = d.username)
+         GROUP BY d.username
+         ORDER BY COALESCE(MAX(p.unit), '') = '', MAX(p.unit), callsign`
+    );
+    return res.json(result.rows);
+});
+
 app.get('/api/users', authenticate, async (req, res) => {
     const result = await pool.query(
-        `SELECT username,
-                COALESCE(MAX(NULLIF(callsign, '')), username) AS callsign,
-                BOOL_OR(last_seen >= now() - INTERVAL '2 minutes') AS "isOnline"
-         FROM devices
-         WHERE username IS NOT NULL
+        `SELECT d.username,
+                COALESCE(MAX(NULLIF(p.callsign, '')), MAX(NULLIF(d.callsign, '')), d.username) AS callsign,
+                COALESCE(MAX(p.position), '') AS position,
+                COALESCE(MAX(p.unit), '') AS unit,
+                BOOL_OR(d.last_seen >= now() - INTERVAL '2 minutes') AS "isOnline"
+         FROM devices d
+         LEFT JOIN user_profiles p ON p.username = d.username
+         WHERE d.username IS NOT NULL
            AND NOT EXISTS (
-               SELECT 1 FROM deleted_users deleted WHERE deleted.username = devices.username
+               SELECT 1 FROM deleted_users deleted WHERE deleted.username = d.username
            )
-         GROUP BY username
-         ORDER BY callsign, username`
+         GROUP BY d.username
+         ORDER BY callsign, d.username`
     );
     return res.json(result.rows);
 });
@@ -246,9 +271,11 @@ app.get('/api/chats', authenticate, async (req, res) => {
     if (!username) return res.status(403).json({ error: 'Account username is not configured' });
     const result = await pool.query(
         `SELECT c.chat_id AS id, c.name, c.created_by AS "createdBy",
-                array_agg(m.username ORDER BY m.username) AS members
+                array_agg(m.username ORDER BY m.username) AS members,
+                COALESCE(MAX(s.auto_delete_hours), 0) AS "autoDeleteHours"
          FROM chats c
          JOIN chat_members m USING (chat_id)
+         LEFT JOIN chat_settings s USING (chat_id)
          WHERE EXISTS (
              SELECT 1 FROM chat_members mine
              WHERE mine.chat_id = c.chat_id AND mine.username = $1
@@ -310,6 +337,102 @@ app.post('/api/chats', authenticate, requireRecordBody, async (req, res) => {
     }
 });
 
+const AUTO_DELETE_HOURS = [0, 1, 5, 12, 24, 48];
+
+// Автоудаление: настройки всех доступных чатов, включая общий — {chatId: часы}.
+app.get('/api/chats/settings', authenticate, async (req, res) => {
+    const username = await firebaseUsername(req.user);
+    if (!username) return res.status(403).json({ error: 'Account username is not configured' });
+    const result = await pool.query(
+        `SELECT chat_id, auto_delete_hours FROM chat_settings
+         WHERE chat_id = 'general'
+            OR chat_id IN (SELECT chat_id FROM chat_members WHERE username = $1)`,
+        [username]
+    );
+    const chats = await pool.query('SELECT chat_id FROM chat_members WHERE username = $1', [username]);
+    const settings = { general: 0 };
+    for (const row of chats.rows) settings[row.chat_id] = 0;
+    for (const row of result.rows) settings[row.chat_id] = row.auto_delete_hours;
+    return res.json(settings);
+});
+
+// Меняет создатель группового чата; общий чат — администратор.
+app.put('/api/chats/:id/auto-delete', authenticate, async (req, res) => {
+    const username = await firebaseUsername(req.user);
+    if (!username) return res.status(403).json({ error: 'Account username is not configured' });
+    const chatId = req.params.id;
+    let allowed = false;
+    if (chatId === 'general') {
+        allowed = req.user.admin === true;
+    } else {
+        const owned = await pool.query('SELECT 1 FROM chats WHERE chat_id = $1 AND created_by = $2', [chatId, username]);
+        allowed = owned.rowCount > 0;
+    }
+    if (!allowed) return res.status(404).json({ error: 'Chat not found or not managed by this account' });
+    const hours = Number(isRecord(req.body) ? req.body.hours : NaN);
+    if (!AUTO_DELETE_HOURS.includes(hours)) return res.status(400).json({ error: 'hours must be one of 0, 1, 5, 12, 24, 48' });
+    await pool.query(
+        `INSERT INTO chat_settings (chat_id, auto_delete_hours) VALUES ($1, $2)
+         ON CONFLICT (chat_id) DO UPDATE SET auto_delete_hours = EXCLUDED.auto_delete_hours`,
+        [chatId, hours]
+    );
+    purgeAutoDeleted().catch((error) => logEvent('error', 'auto_delete_failed', { message: error.message }));
+    return res.json({ id: chatId, autoDeleteHours: hours });
+});
+
+async function purgeAutoDeleted() {
+    const result = await pool.query(
+        `DELETE FROM messages m USING chat_settings s
+         WHERE s.auto_delete_hours > 0
+           AND COALESCE(m.data->>'chat_id', 'general') = s.chat_id
+           AND m.created_at < now() - s.auto_delete_hours * interval '1 hour'`
+    );
+    if (result.rowCount) logEvent('info', 'auto_delete', { messagesDeleted: result.rowCount });
+}
+
+app.patch('/api/chats/:id', authenticate, async (req, res) => {
+    const username = await firebaseUsername(req.user);
+    if (!username) return res.status(403).json({ error: 'Account username is not configured' });
+    const name = isRecord(req.body) ? req.body.name : undefined;
+    if (typeof name !== 'string' || !name.trim() || name.trim().length > 80) {
+        return res.status(400).json({ error: 'Invalid chat name' });
+    }
+    const result = await pool.query(
+        'UPDATE chats SET name = $3 WHERE chat_id = $1 AND created_by = $2 RETURNING chat_id AS id, name, created_by AS "createdBy"',
+        [req.params.id, username, name.trim()]
+    );
+    if (!result.rowCount) return res.status(404).json({ error: 'Chat not found or not owned by this account' });
+    return res.json(result.rows[0]);
+});
+
+async function canReadChat(chatId, username) {
+    if (chatId === 'general') return true;
+    const member = await pool.query('SELECT 1 FROM chat_members WHERE chat_id = $1 AND username = $2', [chatId, username]);
+    return member.rowCount > 0;
+}
+
+app.post('/api/chats/:id/read', authenticate, async (req, res) => {
+    const username = await firebaseUsername(req.user);
+    if (!username || !await canReadChat(req.params.id, username)) return res.status(404).json({ error: 'Chat not found' });
+    const timestamp = Number(isRecord(req.body) ? req.body.timestamp : NaN);
+    if (!Number.isSafeInteger(timestamp) || timestamp <= 0 || timestamp > Date.now() + 60_000) {
+        return res.status(400).json({ error: 'Invalid timestamp' });
+    }
+    await pool.query(
+        `INSERT INTO chat_reads (chat_id, username, read_at) VALUES ($1, $2, $3)
+         ON CONFLICT (chat_id, username) DO UPDATE SET read_at = GREATEST(chat_reads.read_at, EXCLUDED.read_at)`,
+        [req.params.id, username, timestamp]
+    );
+    return res.json({ status: 'ok' });
+});
+
+app.get('/api/chats/:id/reads', authenticate, async (req, res) => {
+    const username = await firebaseUsername(req.user);
+    if (!username || !await canReadChat(req.params.id, username)) return res.status(404).json({ error: 'Chat not found' });
+    const result = await pool.query('SELECT username, read_at FROM chat_reads WHERE chat_id = $1', [req.params.id]);
+    return res.json(Object.fromEntries(result.rows.map((row) => [row.username, Number(row.read_at)])));
+});
+
 app.delete('/api/chats/:id', authenticate, async (req, res) => {
     const username = await firebaseUsername(req.user);
     if (!username) return res.status(403).json({ error: 'Account username is not configured' });
@@ -327,6 +450,8 @@ app.delete('/api/chats/:id', authenticate, async (req, res) => {
         }
         await client.query("DELETE FROM messages WHERE data->>'chat_id' = $1", [req.params.id]);
         await client.query('DELETE FROM chats WHERE chat_id = $1', [req.params.id]);
+        await client.query('DELETE FROM chat_reads WHERE chat_id = $1', [req.params.id]);
+        await client.query('DELETE FROM chat_settings WHERE chat_id = $1', [req.params.id]);
         await client.query('COMMIT');
         return res.json({ status: 'deleted', id: req.params.id });
     } catch (error) {
@@ -367,6 +492,7 @@ app.delete('/api/admin/users/:username', authenticate, async (req, res) => {
             await client.query('DELETE FROM devices WHERE firebase_uid = $1', [targetUser.uid]);
         }
         await client.query('DELETE FROM devices WHERE username = $1', [username]);
+        await client.query('DELETE FROM user_profiles WHERE username = $1', [username]);
         await client.query('DELETE FROM registration_codes WHERE username = $1', [username]);
         await client.query('DELETE FROM chat_members WHERE username = $1', [username]);
         await client.query("DELETE FROM messages WHERE data->>'username' = $1", [username]);
@@ -586,7 +712,12 @@ app.post('/api/registration-codes/verify', verifyFirebaseToken, requireRecordBod
 });
 
 app.post('/api/register', authenticate, requireRecordBody, async (req, res) => {
-    const { phoneId, name, fcmToken, callsign } = req.body;
+    const { phoneId, name, fcmToken, callsign, position, unit } = req.body;
+    for (const [field, value] of [['position', position], ['unit', unit]]) {
+        if (value !== undefined && value !== null && (typeof value !== 'string' || value.length > 120)) {
+            return res.status(400).json({ error: `${field} must be a string of at most 120 characters` });
+        }
+    }
     if (typeof phoneId !== 'string' || phoneId.trim().length < 1 || phoneId.trim().length > 128) {
         return res.status(400).json({ error: 'phoneId must be a non-empty string of at most 128 characters' });
     }
@@ -618,6 +749,16 @@ app.post('/api/register', authenticate, requireRecordBody, async (req, res) => {
             [id, req.user.uid, username, callsign?.trim() || null, name?.trim() || 'Android device', fcmToken?.trim() || null]
         );
         if (!result.rowCount) return res.status(409).json({ error: 'phoneId is registered to another account' });
+        // Профиль — у пользователя; пустые поля не затирают сохранённые.
+        await pool.query(
+            `INSERT INTO user_profiles (username, callsign, position, unit) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (username) DO UPDATE SET
+               callsign = COALESCE(EXCLUDED.callsign, user_profiles.callsign),
+               position = COALESCE(EXCLUDED.position, user_profiles.position),
+               unit = COALESCE(EXCLUDED.unit, user_profiles.unit),
+               updated_at = now()`,
+            [username, callsign?.trim() || null, position?.trim() || null, unit?.trim() || null]
+        );
         return res.json({ status: 'ok', pushEnabled: Boolean(fcmToken) });
     } catch (error) {
         logEvent('error', 'device_registration_failed', { requestId: req.id, message: error.message });
@@ -655,8 +796,13 @@ app.post('/api/send', authenticate, requireRecordBody, async (req, res) => {
         ? req.user.name.trim().slice(0, 120)
         : req.user.uid;
     const client = await pool.connect();
+    let sentAt;
     try {
         await client.query('BEGIN');
+        // now() в транзакции одинаков для всех вставок — это и есть время сообщения.
+        sentAt = Number((await client.query(
+            'SELECT (extract(epoch FROM now()) * 1000)::bigint AS ts'
+        )).rows[0].ts);
         for (const target of recipients) {
             await client.query(
                 `INSERT INTO messages (sender_uid, sender_phone_id, sender_name, recipient_phone_id, text, data)
@@ -675,10 +821,10 @@ app.post('/api/send', authenticate, requireRecordBody, async (req, res) => {
     try {
         const pushBody = data.has_attachment === true ? 'Вложение' : 'Новое сообщение';
         const delivery = await sendPush(recipients, senderName, pushBody, { ...toFcmData(data), sender: senderName });
-        return res.json({ status: 'ok', delivery });
+        return res.json({ status: 'ok', timestamp: sentAt, delivery });
     } catch (error) {
         logEvent('error', 'push_failed', { requestId: req.id, reason: error.code || error.message });
-        return res.json({ status: 'stored', delivery: { sent: 0, failed: recipients.length, notificationError: true } });
+        return res.json({ status: 'stored', timestamp: sentAt, delivery: { sent: 0, failed: recipients.length, notificationError: true } });
     }
 });
 
@@ -745,6 +891,111 @@ app.get('/api/phone/:id', authenticate, async (req, res) => {
     );
     if (!result.rowCount) return res.status(404).json({ error: 'Phone not found' });
     return res.json(result.rows[0]);
+});
+
+// ---------------------------------------------------------------------------
+// Тактические знаки: общие для всех, изменения рассылаются по сокету (marks:changed)
+// ---------------------------------------------------------------------------
+
+const MARK_ID = /^[0-9a-f-]{36}$/i;
+const ICON_ID = /^[a-z0-9_-]{1,64}$/;
+const MAX_ICON_BYTES = 100 * 1024;
+const MARK_COLUMNS = `id::text AS id, type, label, lat, lng, icon, created_by AS "createdBy",
+    (extract(epoch FROM created_at) * 1000)::bigint AS "createdAt"`;
+
+function parseMark(body) {
+    if (!isRecord(body)) return null;
+    const { id, type, label, lat, lng, icon } = body;
+    if (typeof id !== 'string' || !MARK_ID.test(id)) return null;
+    if (typeof type !== 'string' || !type.trim() || type.length > 60) return null;
+    if (label !== undefined && label !== null && (typeof label !== 'string' || label.length > 120)) return null;
+    if (typeof lat !== 'number' || typeof lng !== 'number' || Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
+    if (icon !== undefined && icon !== null && (typeof icon !== 'string' || !/^[a-z0-9_:-]{1,80}$/i.test(icon))) return null;
+    return { id: id.toLowerCase(), type: type.trim(), label: (label || '').trim(), lat, lng, icon: icon || null };
+}
+
+async function insertMarks(marks, username) {
+    let added = 0;
+    for (const mark of marks) {
+        const result = await pool.query(
+            `INSERT INTO tactical_marks (id, type, label, lat, lng, icon, created_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id) DO NOTHING`,
+            [mark.id, mark.type, mark.label, mark.lat, mark.lng, mark.icon, username]
+        );
+        added += result.rowCount;
+    }
+    if (added) io.emit('marks:changed', { at: Date.now() });
+    return added;
+}
+
+app.get('/api/marks', authenticate, async (req, res) => {
+    const result = await pool.query(`SELECT ${MARK_COLUMNS} FROM tactical_marks ORDER BY created_at`);
+    return res.json(result.rows.map((row) => ({ ...row, createdAt: Number(row.createdAt) })));
+});
+
+app.post('/api/marks', authenticate, async (req, res) => {
+    const username = await firebaseUsername(req.user);
+    const mark = parseMark(req.body);
+    if (!username || !mark) return res.status(400).json({ error: 'Invalid mark' });
+    await insertMarks([mark], username);
+    const result = await pool.query(`SELECT ${MARK_COLUMNS} FROM tactical_marks WHERE id = $1`, [mark.id]);
+    return res.json({ ...result.rows[0], createdAt: Number(result.rows[0].createdAt) });
+});
+
+app.post('/api/marks/batch', authenticate, async (req, res) => {
+    const username = await firebaseUsername(req.user);
+    const list = isRecord(req.body) ? req.body.marks : null;
+    if (!username || !Array.isArray(list) || list.length === 0 || list.length > 1000) {
+        return res.status(400).json({ error: 'marks must be an array of 1..1000 items' });
+    }
+    const parsed = list.map(parseMark);
+    if (parsed.some((mark) => !mark)) return res.status(400).json({ error: 'Invalid mark in batch' });
+    return res.json({ added: await insertMarks(parsed, username) });
+});
+
+app.delete('/api/marks/:id', authenticate, async (req, res) => {
+    const username = await firebaseUsername(req.user);
+    if (!MARK_ID.test(String(req.params.id))) return res.status(404).json({ error: 'Mark not found' });
+    const mark = await pool.query('SELECT created_by FROM tactical_marks WHERE id = $1', [req.params.id]);
+    if (!mark.rowCount) return res.status(404).json({ error: 'Mark not found' });
+    if (mark.rows[0].created_by !== username && req.user.admin !== true) {
+        return res.status(403).json({ error: 'Only the author or an administrator can delete this mark' });
+    }
+    await pool.query('DELETE FROM tactical_marks WHERE id = $1', [req.params.id]);
+    io.emit('marks:changed', { at: Date.now() });
+    return res.json({ status: 'deleted', id: req.params.id });
+});
+
+app.get('/api/marks/icons', authenticate, async (req, res) => {
+    const result = await pool.query('SELECT id, name, created_by AS "createdBy" FROM tactical_icons ORDER BY name');
+    return res.json(result.rows);
+});
+
+app.get('/api/marks/icons/:id', authenticate, async (req, res) => {
+    const result = await pool.query('SELECT id, name, data, created_by AS "createdBy" FROM tactical_icons WHERE id = $1', [req.params.id]);
+    if (!result.rowCount) return res.status(404).json({ error: 'Icon not found' });
+    return res.json(result.rows[0]);
+});
+
+app.post('/api/marks/icons', authenticate, async (req, res) => {
+    const username = await firebaseUsername(req.user);
+    const { id, name, data } = isRecord(req.body) ? req.body : {};
+    if (!username || typeof id !== 'string' || !ICON_ID.test(id) || typeof name !== 'string' || !name.trim()
+        || name.length > 60 || typeof data !== 'string') {
+        return res.status(400).json({ error: 'Invalid icon' });
+    }
+    const bytes = Buffer.from(data, 'base64');
+    const isPng = bytes.length > 8 && bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    if (!isPng || bytes.length > MAX_ICON_BYTES) return res.status(400).json({ error: 'Icon must be a PNG up to 100 KB' });
+    const result = await pool.query(
+        `INSERT INTO tactical_icons (id, name, data, created_by) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, data = EXCLUDED.data
+         WHERE tactical_icons.created_by = EXCLUDED.created_by`,
+        [id, name.trim(), data, username]
+    );
+    if (!result.rowCount) return res.status(409).json({ error: 'Icon id is taken' });
+    io.emit('marks:changed', { at: Date.now() });
+    return res.json({ id, name: name.trim() });
 });
 
 app.get('/api/rtc/ice-servers', authenticate, async (req, res) => {
@@ -1000,6 +1251,10 @@ async function start() {
         purgeOldData().catch((error) => logEvent('error', 'retention_failed', { message: error.message }));
     }, 60 * 60 * 1000);
     retentionTimer.unref();
+    const autoDeleteTimer = setInterval(() => {
+        purgeAutoDeleted().catch((error) => logEvent('error', 'auto_delete_failed', { message: error.message }));
+    }, 60_000);
+    autoDeleteTimer.unref();
     const presenceTimer = setInterval(async () => {
         try {
             const sockets = await io.fetchSockets();

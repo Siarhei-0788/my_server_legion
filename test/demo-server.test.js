@@ -153,6 +153,59 @@ describe('demo server contract', () => {
       },
     });
     assert.equal(groupMessage.status, 200);
+    assert.equal(typeof groupMessage.body.timestamp, 'number', 'send returns the server timestamp');
+
+    // Переименование: только создатель.
+    assert.equal((await api(`/api/chats/${chatId}`, { method: 'PATCH', token: bobToken, body: { name: 'Чужое' } })).status, 404);
+    const renamed = await api(`/api/chats/${chatId}`, { method: 'PATCH', token: aliceToken, body: { name: 'Новое имя' } });
+    assert.equal(renamed.status, 200);
+    assert.equal((await api('/api/chats', { token: bobToken })).body.find((chat) => chat.id === chatId).name, 'Новое имя');
+
+    // Отметки прочтения: bob прочитал до времени сообщения, alice это видит.
+    assert.equal((await api(`/api/chats/${chatId}/read`, {
+      method: 'POST', token: bobToken, body: { timestamp: groupMessage.body.timestamp },
+    })).status, 200);
+    const reads = await api(`/api/chats/${chatId}/reads`, { token: aliceToken });
+    assert.equal(reads.body.bob, groupMessage.body.timestamp);
+    assert.equal((await api('/api/chats/general/reads', { token: aliceToken })).status, 200);
+
+    // Автоудаление: групповой чат — только создатель, общий — только администратор.
+    assert.equal((await api(`/api/chats/${chatId}/auto-delete`, { method: 'PUT', token: bobToken, body: { hours: 1 } })).status, 404);
+    assert.equal((await api(`/api/chats/${chatId}/auto-delete`, { method: 'PUT', token: aliceToken, body: { hours: 3 } })).status, 400);
+    assert.equal((await api(`/api/chats/${chatId}/auto-delete`, { method: 'PUT', token: aliceToken, body: { hours: 24 } })).status, 200);
+    assert.equal((await api('/api/chats/general/auto-delete', { method: 'PUT', token: aliceToken, body: { hours: 1 } })).status, 404);
+    assert.equal((await api('/api/chats/general/auto-delete', { method: 'PUT', token: adminToken, body: { hours: 48 } })).status, 200);
+    const settings = await api('/api/chats/settings', { token: bobToken });
+    assert.equal(settings.body[chatId], 24);
+    assert.equal(settings.body.general, 48);
+    assert.equal((await api('/api/chats', { token: bobToken })).body.find((chat) => chat.id === chatId).autoDeleteHours, 24);
+    assert.equal((await api('/api/chats/general/auto-delete', { method: 'PUT', token: adminToken, body: { hours: 0 } })).status, 200);
+    // Свежие сообщения при включении автоудаления не пропадают.
+    assert.ok((await api('/api/messages', { token: bobToken, deviceId: 'device-bob' })).body.some((m) => m.text === 'Только для группы'));
+
+    // Пользователи: позывной (или логин) и признак «в сети».
+    const usersList = await api('/api/users', { token: aliceToken });
+    assert.equal(usersList.status, 200);
+    const bobEntry = usersList.body.find((user) => user.username === 'bob');
+    assert.ok(bobEntry && bobEntry.isOnline === true && bobEntry.callsign === 'bob');
+
+    // Профиль (позывной, должность, подразделение) хранится на сервере у пользователя.
+    assert.equal((await api('/api/register', {
+      method: 'POST', token: aliceToken,
+      body: { phoneId: 'device-alice', name: 'Pixel', callsign: 'Альфа', position: 'Командир', unit: '1 взвод' },
+    })).status, 200);
+    // Пустые поля при повторной регистрации не затирают профиль.
+    await api('/api/register', { method: 'POST', token: aliceToken, body: { phoneId: 'device-alice', callsign: '' } });
+    const aliceUser = (await api('/api/users', { token: bobToken })).body.find((user) => user.username === 'alice');
+    assert.deepEqual([aliceUser.callsign, aliceUser.position, aliceUser.unit], ['Альфа', 'Командир', '1 взвод']);
+
+    assert.equal((await api('/api/admin/users/details', { token: aliceToken })).status, 403);
+    const details = await api('/api/admin/users/details', { token: adminToken });
+    assert.equal(details.status, 200);
+    const aliceDetails = details.body.find((user) => user.username === 'alice');
+    assert.equal(aliceDetails.unit, '1 взвод');
+    assert.equal(aliceDetails.devices, 1);
+    assert.equal(details.body.find((user) => user.username === 'admin').admin, true);
     const messagesAfterGroupSend = await api('/api/messages', { token: bobToken, deviceId: 'device-bob' });
     assert.equal(messagesAfterGroupSend.body.length, 2);
     assert.equal(messagesAfterGroupSend.body[1].text, 'Только для группы');
