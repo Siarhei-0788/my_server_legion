@@ -234,8 +234,9 @@ app.get('/api/admin/users/details', authenticate, async (req, res) => {
                 COALESCE(MAX(p.position), '') AS position,
                 COALESCE(MAX(p.unit), '') AS unit,
                 false AS admin,
-                BOOL_OR(d.last_seen >= now() - INTERVAL '2 minutes') AS "isOnline",
-                MAX(d.last_seen) AS "lastSeen",
+                BOOL_OR(d.last_seen >= now() - INTERVAL '2 minutes'
+                        OR l.updated_at >= now() - INTERVAL '10 minutes') AS "isOnline",
+                GREATEST(MAX(d.last_seen), COALESCE(MAX(l.updated_at), d.last_seen)) AS "lastSeen",
                 COUNT(*)::int AS devices
          FROM devices d
          LEFT JOIN user_profiles p ON p.username = d.username
@@ -253,9 +254,12 @@ app.get('/api/users', authenticate, async (req, res) => {
                 COALESCE(MAX(NULLIF(p.callsign, '')), MAX(NULLIF(d.callsign, '')), d.username) AS callsign,
                 COALESCE(MAX(p.position), '') AS position,
                 COALESCE(MAX(p.unit), '') AS unit,
-                BOOL_OR(d.last_seen >= now() - INTERVAL '2 minutes') AS "isOnline"
+                BOOL_OR(d.last_seen >= now() - INTERVAL '2 minutes'
+                        OR l.updated_at >= now() - INTERVAL '10 minutes') AS "isOnline",
+                MAX(d.last_seen) AS "lastSeen"
          FROM devices d
          LEFT JOIN user_profiles p ON p.username = d.username
+         LEFT JOIN user_locations l ON l.username = d.username
          WHERE d.username IS NOT NULL
            AND NOT EXISTS (
                SELECT 1 FROM deleted_users deleted WHERE deleted.username = d.username
@@ -397,12 +401,78 @@ app.patch('/api/chats/:id', authenticate, async (req, res) => {
     if (typeof name !== 'string' || !name.trim() || name.trim().length > 80) {
         return res.status(400).json({ error: 'Invalid chat name' });
     }
+    // Переименовать может создатель или администратор (как в demo-сервере).
     const result = await pool.query(
-        'UPDATE chats SET name = $3 WHERE chat_id = $1 AND created_by = $2 RETURNING chat_id AS id, name, created_by AS "createdBy"',
-        [req.params.id, username, name.trim()]
+        `UPDATE chats SET name = $3 WHERE chat_id = $1 AND (created_by = $2 OR $4::boolean)
+         RETURNING chat_id AS id, name, created_by AS "createdBy"`,
+        [req.params.id, username, name.trim(), req.user.admin === true]
     );
     if (!result.rowCount) return res.status(404).json({ error: 'Chat not found or not owned by this account' });
     return res.json(result.rows[0]);
+});
+
+/**
+ * Состав группового чата: создатель или администратор присылает список участников
+ * целиком; сервер сам вычисляет добавленных и удалённых и рассылает event chat:changed.
+ * Создателя из чата удалить нельзя.
+ */
+app.put('/api/chats/:id/members', authenticate, requireRecordBody, async (req, res) => {
+    const username = await firebaseUsername(req.user);
+    if (!username) return res.status(403).json({ error: 'Account username is not configured' });
+    if (req.params.id === 'general') {
+        return res.status(400).json({ error: 'Members of the general chat are all unit members' });
+    }
+    const requested = isRecord(req.body) ? req.body.members : null;
+    if (!Array.isArray(requested) || requested.length === 0 || requested.length > 100 ||
+        requested.some((member) => typeof member !== 'string' || !/^[a-zA-Z0-9._-]{1,64}$/.test(member))) {
+        return res.status(400).json({ error: 'members must be an array of 1..100 usernames' });
+    }
+    const next = [...new Set(requested.map((member) => member.trim().toLowerCase()))];
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const chat = await client.query(
+            'SELECT created_by FROM chats WHERE chat_id = $1 AND (created_by = $2 OR $3::boolean) FOR UPDATE',
+            [req.params.id, username, req.user.admin === true]
+        );
+        if (!chat.rowCount) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Chat not found or not owned by this account' });
+        }
+        const createdBy = chat.rows[0].created_by;
+        if (!next.includes(createdBy)) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'The chat creator must stay a member' });
+        }
+        const deleted = await client.query(
+            'SELECT username FROM deleted_users WHERE username = ANY($1::text[]) LIMIT 1', [next]
+        );
+        if (deleted.rowCount) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'A deleted user cannot be added to a chat' });
+        }
+        const current = await client.query('SELECT username FROM chat_members WHERE chat_id = $1', [req.params.id]);
+        const before = current.rows.map((row) => row.username);
+        const added = next.filter((member) => !before.includes(member));
+        const removed = before.filter((member) => !next.includes(member));
+        for (const member of added) {
+            await client.query('INSERT INTO chat_members (chat_id, username) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                [req.params.id, member]);
+        }
+        for (const member of removed) {
+            await client.query('DELETE FROM chat_members WHERE chat_id = $1 AND username = $2', [req.params.id, member]);
+        }
+        await client.query('COMMIT');
+        io.emit('chat:changed', { chatId: req.params.id, added, removed });
+        logEvent('info', 'chat_members_updated', { chatId: req.params.id, added: added.length, removed: removed.length });
+        return res.json({ id: req.params.id, createdBy, members: next, added, removed });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        logEvent('error', 'chat_members_failed', { requestId: req.id, message: error.message });
+        return res.status(500).json({ error: 'Chat members could not be updated' });
+    } finally {
+        client.release();
+    }
 });
 
 async function canReadChat(chatId, username) {
@@ -440,9 +510,10 @@ app.delete('/api/chats/:id', authenticate, async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
+        // Администратор может удалить любой чат; остальные — только свои (созданные ими).
         const chat = await client.query(
-            'SELECT chat_id FROM chats WHERE chat_id = $1 AND created_by = $2 FOR UPDATE',
-            [req.params.id, username]
+            'SELECT chat_id FROM chats WHERE chat_id = $1 AND (created_by = $2 OR $3::boolean) FOR UPDATE',
+            [req.params.id, username, req.user.admin === true]
         );
         if (!chat.rowCount) {
             await client.query('ROLLBACK');
@@ -453,7 +524,8 @@ app.delete('/api/chats/:id', authenticate, async (req, res) => {
         await client.query('DELETE FROM chat_reads WHERE chat_id = $1', [req.params.id]);
         await client.query('DELETE FROM chat_settings WHERE chat_id = $1', [req.params.id]);
         await client.query('COMMIT');
-        return res.json({ status: 'deleted', id: req.params.id });
+        io.emit('chat:deleted', { id: req.params.id });
+    return res.json({ status: 'deleted', id: req.params.id });
     } catch (error) {
         await client.query('ROLLBACK');
         logEvent('error', 'chat_delete_failed', { requestId: req.id, message: error.message });
@@ -493,6 +565,7 @@ app.delete('/api/admin/users/:username', authenticate, async (req, res) => {
         }
         await client.query('DELETE FROM devices WHERE username = $1', [username]);
         await client.query('DELETE FROM user_profiles WHERE username = $1', [username]);
+        await client.query('DELETE FROM user_locations WHERE username = $1', [username]);
         await client.query('DELETE FROM registration_codes WHERE username = $1', [username]);
         await client.query('DELETE FROM chat_members WHERE username = $1', [username]);
         await client.query("DELETE FROM messages WHERE data->>'username' = $1", [username]);
@@ -578,17 +651,53 @@ async function sendPush(phoneIds, title, body, data = {}) {
 
     const fcmData = toFcmData(data);
     const isCall = fcmData.type === 'rtc_call';
+    // Сбор о сборе: канал с мелодией будильника (звук задаёт клиент, канал alerts).
+    const isAlert = fcmData.type === 'alert';
+    // Клиент (LegionMessagingService) по наличию notification-блока понимает, что система
+    // покажет уведомление сама при свёрнутом приложении. Телефонам без
+    // POST_NOTIFICATIONS (Android 13+, система блокирует) и всем со свёрнутым
+    // приложением нужен именно notification-блок — иначе фоновое уведомление не появится.
     const notificationData = isCall ? { ...fcmData, title, body } : fcmData;
     const response = await getMessaging(firebaseApp()).sendEachForMulticast({
         tokens: devices.map(({ fcm_token: token }) => token),
         ...(isCall ? {} : { notification: { title, body } }),
-        data: notificationData,
+        // app_id/project_id обязательны в data для однозначной инициализации SDK.
+        data: { ...notificationData, projectId: projectId || undefined },
         android: {
             priority: 'high',
             ...(isCall ? {
                 ttl: 60_000,
-            } : {})
-        }
+            } : { ttl: 24 * 60 * 60 * 1000 }),
+            ...(isAlert ? {
+                ttl: 10 * 60_000,
+                notification: {
+                    channelId: 'legion_alerts',
+                    sound: 'alarm',
+                    priority: 'max',
+                    category: 'alarm',
+                    visibility: 'public',
+                },
+            } : {}),
+            ...(isCall ? {
+                notification: {
+                    channelId: 'legion_incoming_calls',
+                    sound: 'default',
+                    priority: 'max',
+                    category: 'call',
+                    visibility: 'public',
+                },
+            } : {}),
+        },
+        apns: {
+            headers: { 'apns-priority': '10' },
+            payload: {
+                aps: {
+                    'content-available': 1,
+                    ...(isCall ? { 'interruption-level': 'time-sensitive' } : {}),
+                },
+            },
+        },
+        webpush: { headers: { Urgency: 'high' } },
     });
 
     const invalidTokens = [];
@@ -780,7 +889,9 @@ app.post('/api/send', authenticate, requireRecordBody, async (req, res) => {
         return res.status(400).json({ error: 'Sensitive control data cannot be sent as chat messages' });
     }
     let recipients;
-    if (data.type === 'text') {
+    // Любое сообщение, привязанное к чату (текст, файл, аудио, изображение), уходит участникам
+    // этого чата; адресное сообщение без chat_id — по полю to.
+    if (data.type === 'text' || typeof data.chat_id === 'string') {
         const chatId = typeof data.chat_id === 'string' ? data.chat_id : 'general';
         const username = await firebaseUsername(req.user);
         recipients = username ? await chatTargetDeviceIds(chatId, username, req.user.uid, phoneId) : null;
@@ -848,6 +959,33 @@ app.post('/api/push', authenticate, requireRecordBody, async (req, res) => {
     }
 });
 
+app.post('/api/alerts/:id/ack', authenticate, async (req, res) => {
+    const alertId = Number(req.params.id);
+    if (!Number.isFinite(alertId)) return res.status(400).json({ error: 'Invalid alert id' });
+    const username = await firebaseUsername(req.user);
+    if (!username) return res.status(403).json({ error: 'Account is not enabled for this service' });
+    await pool.query(
+        `INSERT INTO alert_responses (alert_id, username, status)
+         VALUES ($1, $2, 'confirmed')
+         ON CONFLICT (alert_id, username) DO UPDATE SET status='confirmed', responded_at=now()`,
+        [alertId, username]
+    );
+    io.to('admin').emit('alert:ack', { alertId, username });
+    return res.json({ status: 'ok' });
+});
+
+app.get('/api/alerts/:id/responses', authenticate, async (req, res) => {
+    const alertId = Number(req.params.id);
+    if (!Number.isFinite(alertId)) return res.status(400).json({ error: 'Invalid alert id' });
+    const result = await pool.query(
+        `SELECT username, status, responded_at FROM alert_responses WHERE alert_id = $1 ORDER BY responded_at`,
+        [alertId]
+    );
+    return res.json(result.rows);
+});
+
+// Входящие сообщения устройства. Раньше у маршрута не было заголовка app.get(...) —
+// файл не проходил `node --check`, и весь сервер не запускался.
 app.get('/api/messages', authenticate, async (req, res) => {
     const phoneId = req.get('x-device-id');
     if (!await verifyDevice(req.user.uid, phoneId)) return res.status(403).json({ error: 'Device is not registered to this account' });
@@ -857,22 +995,26 @@ app.get('/api/messages', authenticate, async (req, res) => {
         `SELECT id::text AS id, sender_name AS "from", recipient_phone_id AS "to", text, data,
                 (extract(epoch FROM created_at) * 1000)::bigint AS "timestamp"
          FROM messages WHERE recipient_phone_id = $1 AND id > $2::bigint
-         ORDER BY id DESC LIMIT 500`,
+         ORDER BY id ASC LIMIT 500`,
         [phoneId, after]
     );
-    return res.json(result.rows.reverse());
+    // По возрастанию от курсора: клиент продвигает курсор и дочитывает пропущенное при следующем опросе,
+    // поэтому даже при очень длинной истории ни одно сообщение (в том числе файл) не теряется.
+    return res.json(result.rows);
 });
 
 app.get('/api/phones', authenticate, async (req, res) => {
     const result = await pool.query(
-        `SELECT phone_id AS id, name, username, callsign, last_seen AS "lastSeen",
-                last_seen >= now() - INTERVAL '2 minutes' AS "isOnline"
-         FROM devices
-         WHERE firebase_uid <> $1 AND fcm_token IS NOT NULL
+        `SELECT d.phone_id AS id, d.name, d.username, d.callsign, d.last_seen AS "lastSeen",
+                (d.last_seen >= now() - INTERVAL '2 minutes'
+                 OR l.updated_at >= now() - INTERVAL '10 minutes') AS "isOnline"
+         FROM devices d
+         LEFT JOIN user_locations l ON l.username = d.username
+         WHERE d.firebase_uid <> $1 AND d.fcm_token IS NOT NULL
            AND NOT EXISTS (
-               SELECT 1 FROM deleted_users deleted WHERE deleted.username = devices.username
+               SELECT 1 FROM deleted_users deleted WHERE deleted.username = d.username
            )
-         ORDER BY last_seen DESC, name`,
+         ORDER BY d.last_seen DESC, d.name`,
         [req.user.uid]
     );
     return res.json(result.rows);
@@ -894,33 +1036,130 @@ app.get('/api/phone/:id', authenticate, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Последние позиции пользователей: хранятся на сервере, обновления — сокетом location:update
+// ---------------------------------------------------------------------------
+
+function parseLocation(body) {
+    if (!isRecord(body)) return null;
+    const { lat, lng, callsign } = body;
+    if (typeof lat !== 'number' || typeof lng !== 'number' || !Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+    if (Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
+    if (callsign !== undefined && callsign !== null && (typeof callsign !== 'string' || callsign.length > 120)) return null;
+    return { lat, lng, callsign: typeof callsign === 'string' ? callsign.trim() : null };
+}
+
+app.post('/api/location', authenticate, requireRecordBody, async (req, res) => {
+    const phoneId = req.get('x-device-id');
+    if (!await verifyDevice(req.user.uid, phoneId)) return res.status(403).json({ error: 'Device is not registered to this account' });
+    const location = parseLocation(req.body);
+    if (!location) return res.status(400).json({ error: 'lat and lng must be valid coordinates' });
+    const username = await firebaseUsername(req.user);
+    if (!username) return res.status(403).json({ error: 'Account username is not configured' });
+    const result = await pool.query(
+        `INSERT INTO user_locations (username, callsign, lat, lng, updated_at)
+         VALUES ($1, $2, $3, $4, now())
+         ON CONFLICT (username) DO UPDATE SET
+           callsign = COALESCE(EXCLUDED.callsign, user_locations.callsign),
+           lat = EXCLUDED.lat, lng = EXCLUDED.lng, updated_at = now()
+         RETURNING username, callsign, lat, lng, (extract(epoch FROM updated_at) * 1000)::bigint AS "updatedAt"`,
+        [username, location.callsign || null, location.lat, location.lng]
+    );
+    const row = result.rows[0];
+    io.emit('location:update', row);
+    return res.json(row);
+});
+
+app.get('/api/locations', authenticate, async (req, res) => {
+    const result = await pool.query(
+        `SELECT l.username, COALESCE(NULLIF(l.callsign, ''), p.callsign, l.username) AS callsign,
+                l.lat, l.lng, (extract(epoch FROM l.updated_at) * 1000)::bigint AS "updatedAt"
+         FROM user_locations l
+         LEFT JOIN user_profiles p ON p.username = l.username
+         WHERE NOT EXISTS (SELECT 1 FROM deleted_users deleted WHERE deleted.username = l.username)`
+    );
+    return res.json(result.rows);
+});
+
+// ---------------------------------------------------------------------------
+// Сборы: подтверждение получения сразу видно администратору (событие alert:ack)
+// ---------------------------------------------------------------------------
+
+const ALERT_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
+// Получатель подтверждает сбор. Администратор получает событие alert:ack мгновенно.
+app.post('/api/alerts/:id/ack', authenticate, requireRecordBody, async (req, res) => {
+    const phoneId = req.get('x-device-id');
+    if (!await verifyDevice(req.user.uid, phoneId)) return res.status(403).json({ error: 'Device is not registered to this account' });
+    const alertId = String(req.params.id || '');
+    if (!ALERT_ID.test(alertId)) return res.status(400).json({ error: 'Invalid alert id' });
+    const username = await firebaseUsername(req.user);
+    if (!username) return res.status(403).json({ error: 'Account username is not configured' });
+    const callsign = typeof req.user.name === 'string' && req.user.name.trim() ? req.user.name.trim().slice(0, 120) : username;
+    const result = await pool.query(
+        `INSERT INTO alert_acks (alert_id, username, acked_at) VALUES ($1, $2, now())
+         ON CONFLICT (alert_id, username) DO UPDATE SET acked_at = now()
+         RETURNING alert_id, username, (extract(epoch FROM acked_at) * 1000)::bigint AS "ackedAt"`,
+        [alertId, username]
+    );
+    const ack = { ...result.rows[0], ackedAt: Number(result.rows[0].ackedAt), callsign };
+    io.emit('alert:ack', ack);
+    return res.json(ack);
+});
+
+// Список подтверждений по сбору — для экрана администратора.
+app.get('/api/alerts/:id/acks', authenticate, async (req, res) => {
+    if (req.user.admin !== true) return res.status(403).json({ error: 'Administrator access required' });
+    const alertId = String(req.params.id || '');
+    if (!ALERT_ID.test(alertId)) return res.status(400).json({ error: 'Invalid alert id' });
+    const result = await pool.query(
+        `SELECT a.alert_id, a.username, COALESCE(NULLIF(p.callsign, ''), a.username) AS callsign,
+                (extract(epoch FROM a.acked_at) * 1000)::bigint AS "ackedAt"
+         FROM alert_acks a LEFT JOIN user_profiles p ON p.username = a.username
+         WHERE a.alert_id = $1 ORDER BY a.acked_at`,
+        [alertId]
+    );
+    return res.json(result.rows.map((row) => ({ ...row, ackedAt: Number(row.ackedAt) })));
+});
+
+// ---------------------------------------------------------------------------
 // Тактические знаки: общие для всех, изменения рассылаются по сокету (marks:changed)
 // ---------------------------------------------------------------------------
 
 const MARK_ID = /^[0-9a-f-]{36}$/i;
+/**
+ * Ключ значка у знака: builtin:<key>, custom:<iconId>, путь картинки из KMZ
+ * («styles/Flag.png»), а также AlpineQuest-имена («Summit.png», «Гора») — их клиент
+ * присылает при импорте KML/KMZ.
+ */
+const ICON_KEY = /^[\p{L}\p{N}_.: \\/-]{1,120}$/u;
 const ICON_ID = /^[a-z0-9_-]{1,64}$/;
 const MAX_ICON_BYTES = 100 * 1024;
-const MARK_COLUMNS = `id::text AS id, type, label, lat, lng, icon, created_by AS "createdBy",
+const MARK_COLUMNS = `id::text AS id, type, label, lat, lng, icon, layer, created_by AS "createdBy",
     (extract(epoch FROM created_at) * 1000)::bigint AS "createdAt"`;
+const DEFAULT_MARK_LAYER = 'Общий';
 
 function parseMark(body) {
     if (!isRecord(body)) return null;
-    const { id, type, label, lat, lng, icon } = body;
+    const { id, type, label, lat, lng, icon, layer } = body;
     if (typeof id !== 'string' || !MARK_ID.test(id)) return null;
     if (typeof type !== 'string' || !type.trim() || type.length > 60) return null;
     if (label !== undefined && label !== null && (typeof label !== 'string' || label.length > 120)) return null;
     if (typeof lat !== 'number' || typeof lng !== 'number' || Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
-    if (icon !== undefined && icon !== null && (typeof icon !== 'string' || !/^[a-z0-9_:-]{1,80}$/i.test(icon))) return null;
-    return { id: id.toLowerCase(), type: type.trim(), label: (label || '').trim(), lat, lng, icon: icon || null };
+    // Раньше шаблон ^[a-z0-9_:-]{1,80}$ отклонял значки AlpineQuest («Summit.png»,
+    // «Гора») и custom:<id> — импорт падал на первом же знаке.
+    if (icon !== undefined && icon !== null && (typeof icon !== 'string' || !ICON_KEY.test(icon))) return null;
+    if (layer !== undefined && layer !== null && (typeof layer !== 'string' || layer.trim().length > 60)) return null;
+    const layerName = typeof layer === 'string' && layer.trim() ? layer.trim() : DEFAULT_MARK_LAYER;
+    return { id: id.toLowerCase(), type: type.trim(), label: (label || '').trim(), lat, lng, icon: icon || null, layer: layerName };
 }
 
 async function insertMarks(marks, username) {
     let added = 0;
     for (const mark of marks) {
         const result = await pool.query(
-            `INSERT INTO tactical_marks (id, type, label, lat, lng, icon, created_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id) DO NOTHING`,
-            [mark.id, mark.type, mark.label, mark.lat, mark.lng, mark.icon, username]
+            `INSERT INTO tactical_marks (id, type, label, lat, lng, icon, layer, created_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id) DO NOTHING`,
+            [mark.id, mark.type, mark.label, mark.lat, mark.lng, mark.icon, mark.layer, username]
         );
         added += result.rowCount;
     }
@@ -964,6 +1203,116 @@ app.delete('/api/marks/:id', authenticate, async (req, res) => {
     await pool.query('DELETE FROM tactical_marks WHERE id = $1', [req.params.id]);
     io.emit('marks:changed', { at: Date.now() });
     return res.json({ status: 'deleted', id: req.params.id });
+});
+
+// ---------------------------------------------------------------------------
+// Слои тактических знаков: общие для подразделения. Знак ссылается на слой полем layer;
+// слой без знаков существует отдельно, поэтому клиенты получают список слоёв с сервера
+// (а не выводят его из знаков на карте). Схема — migrations/009_tactical_layers.sql.
+// ---------------------------------------------------------------------------
+
+const LAYER_NAME_MAX = 60;
+const LAYER_COLUMNS = `id::text AS id, name, "order", created_by AS "createdBy",
+    (extract(epoch FROM created_at) * 1000)::bigint AS "createdAt"`;
+
+async function findLayerByName(name) {
+    const result = await pool.query(`SELECT ${LAYER_COLUMNS} FROM tactical_layers WHERE lower(name) = lower($1)`, [name]);
+    return result.rows[0] || null;
+}
+
+async function ensureLayer(name, username) {
+    const result = await pool.query(
+        `INSERT INTO tactical_layers (name, "order", created_by)
+         VALUES ($1, COALESCE((SELECT MAX("order") + 1 FROM tactical_layers), 0), $2)
+         ON CONFLICT (name) DO UPDATE SET name = tactical_layers.name
+         RETURNING ${LAYER_COLUMNS.replace(/created_at/g, 'tactical_layers.created_at').replace(/id::text/g, 'tactical_layers.id::text')}`,
+        [name.trim().slice(0, LAYER_NAME_MAX), username]
+    );
+    return result.rows[0];
+}
+
+app.get('/api/mark-layers', authenticate, async (req, res) => {
+    const result = await pool.query(`SELECT ${LAYER_COLUMNS} FROM tactical_layers ORDER BY "order", name`);
+    if (!result.rowCount) {
+        // Первый запуск: «Общий» создаётся лениво, чтобы не зависеть от прогона миграции с данными.
+        await ensureLayer(DEFAULT_MARK_LAYER, null);
+        const retry = await pool.query(`SELECT ${LAYER_COLUMNS} FROM tactical_layers ORDER BY "order", name`);
+        return res.json(retry.rows.map((row) => ({ ...row, createdAt: Number(row.createdAt) })));
+    }
+    return res.json(result.rows.map((row) => ({ ...row, createdAt: Number(row.createdAt) })));
+});
+
+app.post('/api/mark-layers', authenticate, async (req, res) => {
+    const username = await firebaseUsername(req.user);
+    const name = isRecord(req.body) ? req.body.name : null;
+    if (!username || typeof name !== 'string' || !name.trim() || name.trim().length > LAYER_NAME_MAX) {
+        return res.status(400).json({ error: `Layer name must be 1..${LAYER_NAME_MAX} characters` });
+    }
+    if (await findLayerByName(name)) return res.status(409).json({ error: 'layer_exists' });
+    const layer = await ensureLayer(name, username);
+    io.emit('marks:changed', { at: Date.now() });
+    return res.json({ ...layer, createdAt: Number(layer.createdAt) });
+});
+
+app.patch('/api/mark-layers/:id', authenticate, async (req, res) => {
+    const username = await firebaseUsername(req.user);
+    if (!MARK_ID.test(String(req.params.id))) return res.status(404).json({ error: 'Layer not found' });
+    const name = isRecord(req.body) ? req.body.name : null;
+    if (typeof name !== 'string' || !name.trim() || name.trim().length > LAYER_NAME_MAX) {
+        return res.status(400).json({ error: `Layer name must be 1..${LAYER_NAME_MAX} characters` });
+    }
+    const existing = await pool.query(`SELECT ${LAYER_COLUMNS} FROM tactical_layers WHERE id = $1`, [req.params.id]);
+    if (!existing.rowCount) return res.status(404).json({ error: 'Layer not found' });
+    const layer = existing.rows[0];
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        await client.query('UPDATE tactical_layers SET name = $2 WHERE id = $1', [req.params.id, name.trim()]);
+        await client.query('UPDATE tactical_marks SET layer = $2 WHERE lower(layer) = lower($1)', [layer.name, name.trim()]);
+        await client.query('COMMIT');
+    } catch (error) {
+        await client.query('ROLLBACK');
+        if (error.code === '23505') return res.status(409).json({ error: 'layer_exists' });
+        throw error;
+    } finally {
+        client.release();
+    }
+    io.emit('marks:changed', { at: Date.now() });
+    return res.json({ ...layer, name: name.trim() });
+});
+
+// Удаление слоя: знаки (withMarks=move по умолчанию) переносятся в «Общий» или удаляются.
+app.delete('/api/mark-layers/:id', authenticate, async (req, res) => {
+    const username = await firebaseUsername(req.user);
+    if (!MARK_ID.test(String(req.params.id))) return res.status(404).json({ error: 'Layer not found' });
+    const existing = await pool.query(`SELECT ${LAYER_COLUMNS} FROM tactical_layers WHERE id = $1`, [req.params.id]);
+    if (!existing.rowCount) return res.status(404).json({ error: 'Layer not found' });
+    const layer = existing.rows[0];
+    if (layer.name.toLowerCase() === DEFAULT_MARK_LAYER.toLowerCase()) {
+        return res.status(400).json({ error: 'default_layer' });
+    }
+    if (layer.createdBy !== username && req.user.admin !== true) {
+        return res.status(403).json({ error: 'Only the author or an administrator can delete this layer' });
+    }
+    const withMarks = String(req.query.withMarks || 'move');
+    if (!['move', 'delete'].includes(withMarks)) {
+        return res.status(400).json({ error: 'withMarks must be move or delete' });
+    }
+    const defaultLayer = await ensureLayer(DEFAULT_MARK_LAYER, null);
+    let affected;
+    if (withMarks === 'delete') {
+        const removed = await pool.query('DELETE FROM tactical_marks WHERE lower(layer) = lower($1)', [layer.name]);
+        affected = removed.rowCount;
+    } else {
+        const moved = await pool.query('UPDATE tactical_marks SET layer = $2 WHERE lower(layer) = lower($1)', [layer.name, defaultLayer.name]);
+        affected = moved.rowCount;
+    }
+    await pool.query('DELETE FROM tactical_layers WHERE id = $1', [req.params.id]);
+    io.emit('marks:changed', { at: Date.now() });
+    return res.json({
+        status: 'deleted', id: layer.id, affectedMarks: affected,
+        movedTo: withMarks === 'move' ? defaultLayer.name : null,
+    });
 });
 
 app.get('/api/marks/icons', authenticate, async (req, res) => {
@@ -1235,7 +1584,14 @@ async function start() {
         throw new Error('DATABASE_URL, REDIS_URL, FIREBASE_PROJECT_ID, and a 32+ character REGISTRATION_CODE_SECRET are required');
     }
     await pool.query('SELECT 1');
-    await redisPub.connect();
+    await pool.query(`CREATE TABLE IF NOT EXISTS alert_responses (
+        alert_id bigint NOT NULL,
+        username text NOT NULL,
+        status text NOT NULL DEFAULT 'confirmed',
+        responded_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (alert_id, username)
+    )`);
+    await pool.query('CREATE INDEX IF NOT EXISTS alert_responses_alert_idx ON alert_responses (alert_id)');
     await redisSub.connect();
     io.adapter(createAdapter(redisPub, redisSub));
     await new Promise((resolve, reject) => {

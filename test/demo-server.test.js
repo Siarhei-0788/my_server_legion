@@ -331,4 +331,121 @@ describe('demo server contract', () => {
     assert.ok(Array.isArray(ice.body.iceServers));
     assert.ok(ice.body.iceServers[0].urls.includes('stun:stun.l.google.com:19302'));
   });
+
+  it('records alert acknowledgements and shows them to the administrator', async () => {
+    const adminToken = await devLogin('admin', 'demo-admin-pass');
+    const token = await devLogin('dave', 'DavePass12');
+    const alertKey = 'a1b2c3d4e5f60718a9b0c1d2e3f40516';
+
+    const ack = await api(`/api/alerts/${alertKey}/ack`, {
+      method: 'POST', token, deviceId: 'device-dave', body: { ack: true },
+    });
+    assert.equal(ack.status, 200);
+    assert.equal(ack.body.username, 'dave');
+
+    const acks = await api(`/api/alerts/${alertKey}/acks`, { token: adminToken });
+    assert.equal(acks.status, 200);
+    assert.ok(acks.body.some((row) => row.username === 'dave'), 'admin sees the acknowledgement');
+
+    const forbidden = await api(`/api/alerts/${alertKey}/acks`, { token });
+    assert.equal(forbidden.status, 403, 'non-admin cannot read the acknowledgement list');
+  });
+
+  it('keeps the last location of each user and returns it to others', async () => {
+    const token = await devLogin('dave', 'DavePass12');
+    const put = await api('/api/location', {
+      method: 'POST', token, deviceId: 'device-dave', body: { lat: 53.9, lng: 27.56, callsign: 'Дэйв' },
+    });
+    assert.equal(put.status, 200);
+
+    const list = await api('/api/locations', { token });
+    assert.equal(list.status, 200);
+    const dave = list.body.find((row) => row.username === 'dave');
+    assert.ok(dave, 'dave location is stored');
+    assert.equal(dave.callsign, 'Дэйв');
+    assert.equal(dave.lat, 53.9);
+
+    const invalid = await api('/api/location', {
+      method: 'POST', token, deviceId: 'device-dave', body: { lat: 200, lng: 27 },
+    });
+    assert.equal(invalid.status, 400);
+  });
+
+  it('keeps the callsign of a position when the client sends an empty one', async () => {
+    const adminToken = await devLogin('admin', 'demo-admin-pass');
+    const token = await devLogin('erin', 'ErinPass12');
+    await api('/api/registration-codes', {
+      method: 'POST', token: adminToken, body: { username: 'erin', code: 'ERIN-CODE' },
+    });
+    await api('/api/registration-codes/verify', {
+      method: 'POST', token, body: { username: 'erin', code: 'ERIN-CODE' },
+    });
+    await api('/api/register', {
+      method: 'POST', token, body: { phoneId: 'device-erin', name: 'Pixel', callsign: 'Гроза' },
+    });
+
+    // Пустой позывной в позиции не должен превращать маркер на карте в логин.
+    const first = await api('/api/location', {
+      method: 'POST', token, deviceId: 'device-erin', body: { lat: 53.1, lng: 27.2, callsign: '' },
+    });
+    assert.equal(first.status, 200);
+    assert.equal(first.body.callsign, 'Гроза', 'callsign taken from the device profile');
+    const second = await api('/api/location', {
+      method: 'POST', token, deviceId: 'device-erin', body: { lat: 53.2, lng: 27.3 },
+    });
+    assert.equal(second.body.callsign, 'Гроза', 'previous callsign is kept');
+  });
+
+  it('creates, renames and deletes mark layers shared by the unit', async () => {
+    const adminToken = await devLogin('admin', 'demo-admin-pass');
+    const token = await devLogin('dave', 'DavePass12');
+
+    const initial = await api('/api/mark-layers', { token });
+    assert.equal(initial.status, 200);
+    assert.ok(initial.body.some((layer) => layer.name === 'Общий'), 'the default layer always exists');
+
+    const created = await api('/api/mark-layers', { method: 'POST', token, body: { name: 'Разведка' } });
+    assert.equal(created.status, 200);
+    assert.equal(created.body.name, 'Разведка');
+    // Повторное создание и создание чужого — только через администратора; дубль отклоняется.
+    assert.equal((await api('/api/mark-layers', { method: 'POST', token, body: { name: 'разведка' } })).status, 409);
+    assert.equal((await api('/api/mark-layers', { method: 'POST', token, body: { name: '' } })).status, 400);
+
+    const markId = '5b0e5b52-4a1f-4f0e-9a49-7d1a7f6a1a11';
+    const mark = await api('/api/marks', {
+      method: 'POST',
+      token,
+      body: { id: markId, type: 'Наблюдательный пункт', label: 'НП-1', lat: 53.9, lng: 27.5, icon: 'builtin:op', layer: 'Разведка' },
+    });
+    assert.equal(mark.status, 200);
+    assert.equal(mark.body.layer, 'Разведка');
+
+    const renamed = await api(`/api/mark-layers/${created.body.id}`, {
+      method: 'PATCH', token, body: { name: 'Разведка 2' },
+    });
+    assert.equal(renamed.status, 200);
+    const marks = await api('/api/marks', { token });
+    assert.equal(marks.body.find((row) => row.id === markId).layer, 'Разведка 2', 'marks follow the renamed layer');
+
+    // Чужой слой: dave — единственный автор слоя, поэтому удаление его же токеном
+    // проходит, а повторное удаление уже нечего удалять.
+    assert.equal((await api(`/api/mark-layers/${created.body.id}`, { method: 'DELETE', token })).status, 200);
+    assert.equal((await api(`/api/mark-layers/${created.body.id}`, { method: 'DELETE', token: adminToken })).status, 404);
+    const afterDelete = await api('/api/marks', { token });
+    assert.equal(afterDelete.body.find((row) => row.id === markId).layer, 'Общий', 'marks move to the default layer');
+    const defaultLayer = (await api('/api/mark-layers', { token })).body.find((layer) => layer.name === 'Общий');
+    assert.equal((await api(`/api/mark-layers/${defaultLayer.id}`, { method: 'DELETE', token: adminToken })).status, 400);
+
+    // withMarks=delete убирает знаки вместе со слоем.
+    const doomed = await api('/api/mark-layers', { method: 'POST', token, body: { name: 'Временный' } });
+    await api('/api/marks', {
+      method: 'POST',
+      token,
+      body: { id: '6c1f6c63-5b20-4a1f-8b5a-8e2b8f7b2b22', type: 'Точка', lat: 53.5, lng: 27.4, layer: 'Временный' },
+    });
+    const removed = await api(`/api/mark-layers/${doomed.body.id}?withMarks=delete`, { method: 'DELETE', token });
+    assert.equal(removed.status, 200);
+    assert.equal(removed.body.affectedMarks, 1);
+    assert.ok(!(await api('/api/marks', { token })).body.some((row) => row.id === '6c1f6c63-5b20-4a1f-8b5a-8e2b8f7b2b22'));
+  });
 });

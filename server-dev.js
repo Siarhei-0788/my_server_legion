@@ -87,8 +87,16 @@ const tacticalMarks = new Map();
 /** id -> {id, name, data (PNG base64), createdBy} — значки, импортированные пользователями */
 const tacticalIcons = new Map();
 const MAX_ICON_BYTES = 100 * 1024;
+/** Слой тактических знаков по умолчанию (поле mark.layer). */
+const DEFAULT_MARK_LAYER = 'Общий';
+/** id -> {id, name, order, createdBy, createdAt} — слои знаков, общие для подразделения */
+const tacticalLayers = new Map();
 
 let nextMessageId = 1;
+
+/** Последняя позиция каждого пользователя (заполняется ниже, читается функциями
+ *  онлайна и сохранения состояния — объявлена до первого обращения к ней). */
+const userLocations = new Map(); // username -> { username, callsign, lat, lng, updatedAt }
 
 // ---------------------------------------------------------------------------
 // Утилиты
@@ -119,7 +127,10 @@ function loadState() {
     for (const message of data.messages || []) messages.push(message);
     for (const [chatId, reads] of data.chatReads || []) chatReads.set(chatId, reads);
     for (const [chatId, hours] of data.chatAutoDelete || []) chatAutoDelete.set(chatId, hours);
-    for (const mark of data.tacticalMarks || []) tacticalMarks.set(mark.id, mark);
+    for (const row of data.userLocations || []) userLocations.set(norm(row.username), row);
+    for (const row of data.pushHistory || []) pushHistory.push(row);
+    for (const mark of data.tacticalMarks || []) tacticalMarks.set(mark.id, { layer: DEFAULT_MARK_LAYER, ...mark });
+    for (const layer of data.tacticalLayers || []) tacticalLayers.set(layer.id, layer);
     for (const icon of data.tacticalIcons || []) tacticalIcons.set(icon.id, icon);
     nextMessageId = Number(data.nextMessageId) || messages.length + 1;
     log(`state loaded: users=${users.size} devices=${devices.size} messages=${messages.length}`);
@@ -154,7 +165,10 @@ function saveState() {
       nextMessageId,
       chatReads: [...chatReads.entries()],
       chatAutoDelete: [...chatAutoDelete.entries()],
+      userLocations: [...userLocations.values()],
+      pushHistory: pushHistory.slice(-10),
       tacticalMarks: [...tacticalMarks.values()],
+      tacticalLayers: [...tacticalLayers.values()],
       tacticalIcons: [...tacticalIcons.values()],
     }));
   } catch (error) {
@@ -164,6 +178,10 @@ function saveState() {
 
 // Простое ограничение попыток входа: сервер в интернете, перебор паролей не нужен.
 const authAttempts = new Map();
+
+/** Демо-push (POST /api/push): клиенты игнорируют уже доставленное после перезапуска. */
+const pushHistory = [];
+const MAX_PUSH_HISTORY = 50;
 
 function authRateLimited(ip) {
   const key = ip || 'unknown';
@@ -188,15 +206,13 @@ function seedAdmin() {
     createdAt: previous.createdAt || now(),
   });
 
-  // Пользователи с устройствами: позывной и признак «в сети» (сокет открыт или
-  // устройство обращалось к серверу последние 2 минуты — фоновая служба опрашивает раз в 10 с).
   app.get('/api/users', authenticate, requireAccess, (req, res) => {
     const byUser = new Map();
     for (const device of devices.values()) {
       const username = norm(device.username);
       if (!username || deletedUsers.has(username)) continue;
-      const online = Boolean(io.sockets.adapter.rooms.get(`phone:${device.phoneId}`)?.size)
-        || now() - device.lastSeen < 2 * 60_000;
+      const userDevices = [...devices.values()].filter((d) => norm(d.username) === username);
+      const online = userOnline(userDevices);
       const profile = users.get(username)?.profile || {};
       const entry = byUser.get(username) || {
         username, callsign: profile.callsign || '', position: profile.position || '', unit: profile.unit || '', isOnline: false,
@@ -218,9 +234,6 @@ function seedAdmin() {
       const username = norm(user.username);
       if (user.access !== true || deletedUsers.has(username)) continue;
       const userDevices = [...devices.values()].filter((device) => norm(device.username) === username);
-      const lastSeen = userDevices.reduce((max, device) => Math.max(max, device.lastSeen || 0), 0);
-      const online = userDevices.some((device) => io.sockets.adapter.rooms.get(`phone:${device.phoneId}`)?.size)
-        || (lastSeen > 0 && now() - lastSeen < 2 * 60_000);
       const profile = user.profile || {};
       list.push({
         username,
@@ -228,8 +241,10 @@ function seedAdmin() {
         position: profile.position || '',
         unit: profile.unit || '',
         admin: user.admin === true,
-        isOnline: online,
-        lastSeen: lastSeen ? new Date(lastSeen).toISOString() : null,
+        isOnline: userOnline(userDevices),
+        lastSeen: userDevices.length
+          ? new Date(Math.max(...userDevices.map((d) => d.lastSeen || 0))).toISOString()
+          : null,
         devices: userDevices.length,
       });
     }
@@ -287,11 +302,10 @@ function seedAdmin() {
     const username = norm(req.user.username);
     if (typeof id !== 'string' || !/^[0-9a-f-]{36}$/i.test(id) ||
         typeof name !== 'string' || !name.trim() || name.trim().length > 80 ||
-        !Array.isArray(members) || members.length < 2 || members.length > 100 ||
-        members.some((member) => typeof member !== 'string' || !/^[a-zA-Z0-9._-]{1,64}$/.test(member))) {
+        !validMembers(members) || members.length < 2) {
       return res.status(400).json({ error: 'Invalid chat details' });
     }
-    const normalizedMembers = [...new Set(members.map(norm))];
+    const normalizedMembers = uniqueMembers(members);
     if (!normalizedMembers.includes(username)) return res.status(403).json({ error: 'Creator must be a chat member' });
     if (normalizedMembers.some((member) => deletedUsers.has(member))) {
       return res.status(409).json({ error: 'A deleted user cannot be added to a chat' });
@@ -304,10 +318,11 @@ function seedAdmin() {
     res.json(chat);
   });
 
-  // Переименование: только создатель (общий чат не переименовывается).
+  // Переименование: создатель или администратор (общий чат не переименовывается).
   app.patch('/api/chats/:id', authenticate, requireAccess, (req, res) => {
     const chat = chats.get(req.params.id);
-    if (!chat || chat.createdBy !== norm(req.user.username)) {
+    const username = norm(req.user.username);
+    if (!chat || (chat.createdBy !== username && req.user.admin !== true)) {
       return res.status(404).json({ error: 'Chat not found or not owned by this account' });
     }
     const name = req.body && req.body.name;
@@ -317,6 +332,50 @@ function seedAdmin() {
     chat.name = name.trim();
     scheduleSave();
     res.json(chat);
+  });
+
+  function validMembers(members) {
+    return Array.isArray(members) && members.length <= 100 &&
+      members.every((member) => typeof member === 'string' && /^[a-zA-Z0-9._-]{1,64}$/.test(member));
+  }
+
+  function uniqueMembers(members) {
+    return [...new Set(members.map(norm))];
+  }
+
+  /**
+   * Состав группового чата: создатель или администратор добавляет и удаляет участников.
+   * Список приходит целиком («как в AlpineQuest — галочки»): сервер сам вычисляет,
+   * кого добавить и кого убрать. Создателя из чата удалить нельзя.
+   */
+  app.put('/api/chats/:id/members', authenticate, requireAccess, (req, res) => {
+    if (req.params.id === 'general') {
+      return res.status(400).json({ error: 'Members of the general chat are all unit members' });
+    }
+    const chat = chats.get(req.params.id);
+    const username = norm(req.user.username);
+    if (!chat) return res.status(404).json({ error: 'Chat not found' });
+    if (chat.createdBy !== username && req.user.admin !== true) {
+      return res.status(403).json({ error: 'Only the creator or an administrator can edit members' });
+    }
+    const requested = req.body && req.body.members;
+    if (!validMembers(requested) || requested.length === 0) {
+      return res.status(400).json({ error: 'members must be an array of 1..100 usernames' });
+    }
+    const next = uniqueMembers(requested);
+    if (!next.includes(chat.createdBy)) {
+      return res.status(400).json({ error: 'The chat creator must stay a member' });
+    }
+    if (next.some((member) => deletedUsers.has(member))) {
+      return res.status(409).json({ error: 'A deleted user cannot be added to a chat' });
+    }
+    const added = next.filter((member) => !chat.members.includes(member));
+    const removed = chat.members.filter((member) => !next.includes(member));
+    chat.members = next;
+    scheduleSave();
+    io.emit('chats:changed', { chatId: chat.id, added, removed });
+    log(`chat ${chat.id}: members updated by ${username} (+${added.length} -${removed.length})`);
+    res.json({ ...chat, added, removed });
   });
 
   // Отметки прочтения: участник сообщает серверное время последнего прочитанного сообщения.
@@ -345,11 +404,11 @@ function seedAdmin() {
     res.json(chatReads.get(req.params.id) || {});
   });
 
-  // Как в production: удалить может только создатель; вместе с чатом удаляются его
-  // сообщения (включая служебное chat_created, иначе клиент восстановит чат из истории).
+  // Как в production: удалить может создатель или администратор (любой чат); вместе с чатом
+  // удаляются его сообщения (включая служебное chat_created, иначе клиент восстановит чат из истории).
   app.delete('/api/chats/:id', authenticate, requireAccess, (req, res) => {
     const chat = chats.get(req.params.id);
-    if (!chat || chat.createdBy !== norm(req.user.username)) {
+    if (!chat || (chat.createdBy !== norm(req.user.username) && req.user.admin !== true)) {
       return res.status(404).json({ error: 'Chat not found or not owned by this account' });
     }
     chats.delete(req.params.id);
@@ -359,6 +418,9 @@ function seedAdmin() {
       if (messages[index].data?.chat_id === req.params.id) messages.splice(index, 1);
     }
     scheduleSave();
+    // Остальные участники узнают об удалении мгновенно (failover: и опросом /api/chats).
+    io.emit('chats:changed', { chatId: req.params.id, deleted: true });
+    log(`chat ${req.params.id} deleted by ${norm(req.user.username)}`);
     res.json({ status: 'deleted', id: req.params.id });
   });
 
@@ -390,6 +452,30 @@ function seedAdmin() {
   if (!process.env.ADMIN_PASSWORD) {
     log(`WARN: demo admin "${ADMIN_USERNAME}" uses the default password; set ADMIN_PASSWORD`);
   }
+}
+
+/**
+ * «В сети»: сокет открыт, устройство обращалось к серверу последние 2 минуты
+ * (фоновая служба опрашивает раз в 10 с) или пришла свежая геолокация за 10 минут —
+ * её фоновая служба передаёт даже при закрытом экране.
+ */
+const LOCATION_ONLINE_MS = 10 * 60_000;
+
+function userOnline(userDevices) {
+  const rooms = io.sockets?.adapter?.rooms;
+  if (rooms) {
+    for (const device of userDevices) {
+      if (rooms.get(`phone:${device.phoneId}`)?.size) return true;
+    }
+  }
+  const lastSeen = userDevices.reduce((max, d) => Math.max(max, d.lastSeen || 0), 0);
+  if (lastSeen > 0 && now() - lastSeen < 2 * 60_000) return true;
+  const deviceForUser = userDevices[0];
+  if (deviceForUser) {
+    const loc = userLocations.get(norm(deviceForUser.username));
+    if (loc && now() - loc.updatedAt < LOCATION_ONLINE_MS) return true;
+  }
+  return false;
 }
 
 function issueToken(username) {
@@ -559,11 +645,14 @@ app.post('/api/register', authenticate, requireAccess, (req, res) => {
   res.json({ status: 'ok', pushEnabled: false, demo: true });
 });
 
+// Список устройств подразделения (зарегистрированных через /api/register) — для
+// собеседников и координат. История сообщений запрашивается отдельно: без
+// X-Device-ID вызову не нужен зарегистрированный телефон.
 app.get('/api/phones', authenticate, requireAccess, (req, res) => {
   const list = [...devices.values()]
     .filter((device) => norm(device.username) !== norm(req.user.username))
     .sort((a, b) => b.lastSeen - a.lastSeen)
-    .map(publicDevice);
+    .map((device) => publicDevice(device, userOnline([device])));
   res.json(list);
 });
 
@@ -572,17 +661,18 @@ app.get('/api/phone/:id', authenticate, requireAccess, (req, res) => {
   if (!device || norm(device.username) === norm(req.user.username)) {
     return res.status(404).json({ error: 'Phone not found' });
   }
-  res.json(publicDevice(device));
+  res.json(publicDevice(device, userOnline([device])));
 });
 
 // Позывной нужен клиенту для списка собеседников: без него показывается id устройства.
-function publicDevice(device) {
+function publicDevice(device, isOnline) {
   return {
     id: device.phoneId,
     name: device.name,
     username: device.username,
     callsign: device.callsign || device.username,
     lastSeen: new Date(device.lastSeen).toISOString(),
+    isOnline,
   };
 }
 
@@ -609,7 +699,8 @@ app.post('/api/send', authenticate, requireAccess, (req, res) => {
   }
 
   let targets;
-  if (data.type === 'text') {
+  // Любое сообщение с chat_id (текст, файл, аудио, изображение) — участникам этого чата.
+  if (data.type === 'text' || typeof data.chat_id === 'string') {
     const chatId = typeof data.chat_id === 'string' ? data.chat_id : 'general';
     if (chatId === 'general') {
       targets = [...devices.values()]
@@ -672,7 +763,38 @@ app.get('/api/messages', authenticate, requireAccess, (req, res) => {
 });
 
 app.post('/api/push', authenticate, requireAccess, requireAdmin, (req, res) => {
-  res.status(501).json({ error: 'Push is not available in demo mode' });
+  // В демонстрационном (dev) режиме Firebase не настроен: пуши уходят через сокет
+  // (событие push:message) всем подключённым устройствам. Клиент показывает ту же
+  // нотификацию, что и в production, — это позволяет проверить настройки
+  // уведомлений и канал без облачного проекта.
+  const { title, body, data } = req.body || {};
+  if (typeof title !== 'string' || !title.trim() || title.length > 120
+      || typeof body !== 'string' || body.length > 1000 || (data !== undefined && !isRecord(data))) {
+    return res.status(400).json({ error: 'Invalid notification payload' });
+  }
+  const payload = { title: title.trim(), body, data: data || {}, sentAt: now() };
+  pushHistory.push(payload);
+  if (pushHistory.length > MAX_PUSH_HISTORY) pushHistory.splice(0, pushHistory.length - MAX_PUSH_HISTORY);
+  io.emit('push:message', payload);
+  const online = io.sockets?.sockets?.size || 0;
+  log(`demo push "${payload.title}" to ${online} socket(s)`);
+  scheduleSave();
+  res.json({ status: 'ok', demo: true, delivery: { sent: online, failed: 0, channel: 'socket' } });
+});
+
+// FCM-токены: в dev-режиме регистрируются и хранятся, чтобы клиент видел, что
+// устройство готово к push, но доставка идёт сокетом.
+app.post('/api/push/token', authenticate, requireAccess, (req, res) => {
+  const { fcmToken } = req.body || {};
+  if (typeof fcmToken !== 'string' || fcmToken.length < 10 || fcmToken.length > 4096) {
+    return res.status(400).json({ error: 'fcmToken must be a string of 10..4096 characters' });
+  }
+  const device = devices.get(req.get('x-device-id'));
+  if (!device) return res.status(403).json({ error: 'Device is not registered to this account' });
+  device.fcmToken = fcmToken;
+  device.pushRegisteredAt = now();
+  scheduleSave();
+  res.json({ status: 'ok', demo: true });
 });
 
 // ---------------------------------------------------------------------------
@@ -681,18 +803,28 @@ app.post('/api/push', authenticate, requireAccess, requireAdmin, (req, res) => {
 
 const MARK_ID = /^[0-9a-f-]{36}$/i;
 const ICON_ID = /^[a-z0-9_-]{1,64}$/;
+/**
+ * Ключ значка у знака: builtin:<key>, custom:<iconId>, путь картинки из KMZ
+ * («styles/Flag.png»), а также AlpineQuest-имена («Summit.png», «Гора») — их клиент
+ * присылает при импорте KML/KMZ. Слэш/обратный слэш разрешены только внутри пути.
+ */
+const ICON_KEY = /^[\p{L}\p{N}_.: \\/-]{1,120}$/u;
 
 function parseMark(body, username) {
   if (!isRecord(body)) return null;
-  const { id, type, label, lat, lng, icon } = body;
+  const { id, type, label, lat, lng, icon, layer } = body;
   if (typeof id !== 'string' || !MARK_ID.test(id)) return null;
   if (typeof type !== 'string' || !type.trim() || type.length > 60) return null;
   if (label !== undefined && label !== null && (typeof label !== 'string' || label.length > 120)) return null;
   if (typeof lat !== 'number' || typeof lng !== 'number' || Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
-  if (icon !== undefined && icon !== null && (typeof icon !== 'string' || !/^[a-z0-9_:-]{1,80}$/i.test(icon))) return null;
+  // Раньше здесь был шаблон ^[a-z0-9_:-]{1,80}$: значки AlpineQuest («Summit.png»,
+  // «Гора») и custom:<id> отклоняли всю пачку — импорт не работал вовсе.
+  if (icon !== undefined && icon !== null && (typeof icon !== 'string' || !ICON_KEY.test(icon))) return null;
+  if (layer !== undefined && layer !== null && (typeof layer !== 'string' || layer.trim().length > 60)) return null;
+  const layerName = typeof layer === 'string' && layer.trim() ? layer.trim() : DEFAULT_MARK_LAYER;
   return {
     id: id.toLowerCase(), type: type.trim(), label: (label || '').trim(), lat, lng,
-    icon: icon || null, createdBy: username, createdAt: now(),
+    icon: icon || null, layer: layerName, createdBy: username, createdAt: now(),
   };
 }
 
@@ -700,6 +832,70 @@ function marksChanged() {
   scheduleSave();
   io.emit('marks:changed', { at: now() });
 }
+
+// ---------------------------------------------------------------------------
+// Сборы: подтверждения (в памяти, как и остальное demo-состояние)
+// ---------------------------------------------------------------------------
+
+const alertAcks = new Map(); // alertId -> Map(username -> { username, callsign, ackedAt })
+const ALERT_KEY = /^[A-Za-z0-9_-]{1,64}$/;
+
+app.post('/api/alerts/:id/ack', authenticate, requireAccess, (req, res) => {
+  const alertId = String(req.params.id || '');
+  if (!ALERT_KEY.test(alertId)) return res.status(400).json({ error: 'Invalid alert id' });
+  const username = norm(req.user.username);
+  const callsign = (req.user.name && String(req.user.name).trim()) || username;
+  const ackedAt = now();
+  if (!alertAcks.has(alertId)) alertAcks.set(alertId, new Map());
+  const ack = { alert_id: alertId, username, callsign, ackedAt };
+  alertAcks.get(alertId).set(username, ack);
+  io.emit('alert:ack', ack);
+  res.json(ack);
+});
+
+app.get('/api/alerts/:id/acks', authenticate, requireAccess, (req, res) => {
+  if (req.user.admin !== true) return res.status(403).json({ error: 'Administrator access required' });
+  const alertId = String(req.params.id || '');
+  if (!ALERT_KEY.test(alertId)) return res.status(400).json({ error: 'Invalid alert id' });
+  const rows = [...(alertAcks.get(alertId) || new Map()).values()].sort((a, b) => a.ackedAt - b.ackedAt);
+  res.json(rows.map(({ alert_id, username, callsign, ackedAt }) => ({ alert_id, username, callsign, ackedAt })));
+});
+
+// ---------------------------------------------------------------------------
+// Позиции пользователей: последняя позиция каждого (Map объявлен выше), обновления — сокетом
+// ---------------------------------------------------------------------------
+
+app.post('/api/location', authenticate, requireAccess, (req, res) => {
+  const { lat, lng, callsign } = req.body || {};
+  if (typeof lat !== 'number' || typeof lng !== 'number' || !Number.isFinite(lat) || !Number.isFinite(lng)
+      || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+    return res.status(400).json({ error: 'lat and lng must be valid coordinates' });
+  }
+  const username = norm(req.user.username);
+  const previous = userLocations.get(username);
+  // Позывной: переданный → сохранённый у устройства/профиля → предыдущий → логин.
+  // Раньше при пустом callsign в строке оставался логин, и на карте у всех бойцы
+  // подписывались логинами («admin» вместо «Альфа»).
+  const callerDevice = devices.get(req.get('x-device-id'));
+  const callsignFromProfile = users.get(username)?.profile?.callsign;
+  const row = {
+    username,
+    callsign: (typeof callsign === 'string' && callsign.trim())
+      || callerDevice?.callsign
+      || callsignFromProfile
+      || previous?.callsign
+      || username,
+    lat, lng, updatedAt: now(),
+  };
+  userLocations.set(username, row);
+  io.emit('location:update', row);
+  scheduleSave();
+  res.json(row);
+});
+
+app.get('/api/locations', authenticate, requireAccess, (req, res) => {
+  res.json([...userLocations.values()]);
+});
 
 app.get('/api/marks', authenticate, requireAccess, (req, res) => {
   res.json([...tacticalMarks.values()].sort((a, b) => a.createdAt - b.createdAt));
@@ -743,6 +939,99 @@ app.delete('/api/marks/:id', authenticate, requireAccess, (req, res) => {
   tacticalMarks.delete(mark.id);
   marksChanged();
   res.json({ status: 'deleted', id: mark.id });
+});
+
+// ---------------------------------------------------------------------------
+// Слои тактических знаков: общие для подразделения (имя, порядок, скрытость по умолчанию).
+// Знак ссылается на слой полем layer; слоя без знаков может не быть в /api/marks,
+// поэтому список слоёв хранится отдельно — и его видят все устройства.
+// ---------------------------------------------------------------------------
+
+const LAYER_NAME_MAX = 60;
+
+function findLayer(name) {
+  const key = norm(name);
+  if (!key) return null;
+  return [...tacticalLayers.values()].find((layer) => norm(layer.name) === key) || null;
+}
+
+function ensureLayer(name, username) {
+  const existing = findLayer(name) || findLayer(DEFAULT_MARK_LAYER);
+  if (existing && norm(existing.name) === norm(name)) return existing;
+  const layer = {
+    id: crypto.randomUUID(),
+    name: String(name).trim().slice(0, LAYER_NAME_MAX),
+    order: tacticalLayers.size,
+    createdBy: norm(username),
+    createdAt: now(),
+    hiddenByDefault: false,
+  };
+  tacticalLayers.set(layer.id, layer);
+  return layer;
+}
+
+app.get('/api/mark-layers', authenticate, requireAccess, (req, res) => {
+  res.json([...tacticalLayers.values()].sort((a, b) => a.order - b.order || a.name.localeCompare(b.name)));
+});
+
+app.post('/api/mark-layers', authenticate, requireAccess, (req, res) => {
+  const { name } = req.body || {};
+  if (typeof name !== 'string' || !name.trim() || name.trim().length > LAYER_NAME_MAX) {
+    return res.status(400).json({ error: `Layer name must be 1..${LAYER_NAME_MAX} characters` });
+  }
+  if (findLayer(name)) return res.status(409).json({ error: 'layer_exists' });
+  const layer = ensureLayer(name, req.user.username);
+  marksChanged();
+  res.json(layer);
+});
+
+// Переименование слоя: знаки переезжают вместе с ним.
+app.patch('/api/mark-layers/:id', authenticate, requireAccess, (req, res) => {
+  const layer = tacticalLayers.get(req.params.id);
+  if (!layer) return res.status(404).json({ error: 'Layer not found' });
+  const { name } = req.body || {};
+  if (typeof name !== 'string' || !name.trim() || name.trim().length > LAYER_NAME_MAX) {
+    return res.status(400).json({ error: `Layer name must be 1..${LAYER_NAME_MAX} characters` });
+  }
+  const clash = findLayer(name);
+  if (clash && clash.id !== layer.id) return res.status(409).json({ error: 'layer_exists' });
+  const previous = layer.name;
+  layer.name = name.trim();
+  if (norm(previous) !== norm(layer.name)) {
+    for (const mark of tacticalMarks.values()) {
+      if (norm(mark.layer) === norm(previous)) mark.layer = layer.name;
+    }
+  }
+  marksChanged();
+  res.json(layer);
+});
+
+// Удаление слоя. Знаки слоя по умолчанию переносятся в «Общий» (withMarks=delete — удаляются).
+// Удалить может автор слоя или администратор; «Общий» удалить нельзя.
+app.delete('/api/mark-layers/:id', authenticate, requireAccess, (req, res) => {
+  const layer = tacticalLayers.get(req.params.id);
+  if (!layer) return res.status(404).json({ error: 'Layer not found' });
+  if (norm(layer.name) === norm(DEFAULT_MARK_LAYER)) {
+    return res.status(400).json({ error: 'default_layer' });
+  }
+  if (layer.createdBy !== norm(req.user.username) && req.user.admin !== true) {
+    return res.status(403).json({ error: 'Only the author or an administrator can delete this layer' });
+  }
+  const withMarks = String(req.query.withMarks || 'move');
+  if (!['move', 'delete'].includes(withMarks)) {
+    return res.status(400).json({ error: 'withMarks must be move or delete' });
+  }
+  const defaultLayer = ensureLayer(DEFAULT_MARK_LAYER, ADMIN_USERNAME);
+  let affected = 0;
+  for (const [markId, mark] of tacticalMarks) {
+    if (norm(mark.layer) !== norm(layer.name)) continue;
+    affected += 1;
+    if (withMarks === 'delete') tacticalMarks.delete(markId);
+    else mark.layer = defaultLayer.name;
+  }
+  tacticalLayers.delete(layer.id);
+  marksChanged();
+  res.json({ status: 'deleted', id: layer.id, affectedMarks: affected, movedTo: withMarks === 'move' ? defaultLayer.name : null });
 });
 
 // Пользовательские значки (импорт набора PNG): нужны всем, кто видит знак с таким значком.
@@ -993,6 +1282,16 @@ setInterval(purgeAutoDeleted, 60_000).unref();
 
 loadState();
 seedAdmin();
+// «Общий» — всегда существующий слой: в него попадают знаки без выбранного слоя.
+if (!findLayer(DEFAULT_MARK_LAYER)) {
+  tacticalLayers.set('default-layer', {
+    id: 'default-layer',
+    name: DEFAULT_MARK_LAYER,
+    order: -1,
+    createdBy: ADMIN_USERNAME,
+    createdAt: 0,
+  });
+}
 scheduleSave();
 
 server.listen(PORT, '0.0.0.0', () => {
@@ -1014,4 +1313,4 @@ function shutdown(signal) {
 process.once('SIGINT', () => shutdown('SIGINT'));
 process.once('SIGTERM', () => shutdown('SIGTERM'));
 
-module.exports = { app, server, users, devices, messages, calls, saveState, loadState };
+module.exports = { app, server, users, devices, messages, calls, saveState, loadState, io };
