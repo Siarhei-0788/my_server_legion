@@ -2,3 +2,6 @@ fcm-tokens.json
 .env
 secrets/
 node_modules/
+
+# Firebase service account keys
+*firebase-adminsdk*.json

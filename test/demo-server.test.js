@@ -199,6 +199,19 @@ describe('demo server contract', () => {
     const aliceUser = (await api('/api/users', { token: bobToken })).body.find((user) => user.username === 'alice');
     assert.deepEqual([aliceUser.callsign, aliceUser.position, aliceUser.unit], ['Альфа', 'Командир', '1 взвод']);
 
+    // Общий телефон: вход под другим аккаунтом переносит устройство, а не даёт 409.
+    assert.equal((await api('/api/register', {
+      method: 'POST', token: bobToken, body: { phoneId: 'device-alice', name: 'Pixel' },
+    })).status, 200);
+    let shared = (await api('/api/phones', { token: aliceToken })).body.find((phone) => phone.id === 'device-alice');
+    assert.equal(shared.username, 'bob');
+    assert.notEqual(shared.callsign, 'Альфа');
+    assert.equal((await api('/api/register', {
+      method: 'POST', token: aliceToken, body: { phoneId: 'device-alice', name: 'Pixel' },
+    })).status, 200);
+    shared = (await api('/api/phones', { token: bobToken })).body.find((phone) => phone.id === 'device-alice');
+    assert.equal(shared.username, 'alice');
+
     assert.equal((await api('/api/admin/users/details', { token: aliceToken })).status, 403);
     const details = await api('/api/admin/users/details', { token: adminToken });
     assert.equal(details.status, 200);

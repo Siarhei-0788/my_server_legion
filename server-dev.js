@@ -619,9 +619,15 @@ app.post('/api/register', authenticate, requireAccess, (req, res) => {
     return res.status(400).json({ error: 'callsign must be a string of at most 120 characters' });
   }
   const id = phoneId.trim();
-  const existing = devices.get(id);
-  if (existing && norm(existing.username) !== norm(req.user.username)) {
-    return res.status(409).json({ error: 'phoneId is registered to another account' });
+  const previous = devices.get(id);
+  // Телефон общий: под любым аккаунтом можно войти с любого телефона. Устройство
+  // переходит к тому, кто вошёл последним; сокеты прежнего владельца на этом
+  // телефоне отключаются (их звонки завершатся в обработчике disconnect).
+  const reassigned = Boolean(previous && norm(previous.username) !== norm(req.user.username));
+  const existing = reassigned ? null : previous;
+  if (reassigned) {
+    log(`device ${id} moved from ${previous.username} to ${req.user.username}`);
+    io.in(`phone:${id}`).disconnectSockets(true);
   }
   devices.set(id, {
     phoneId: id,
